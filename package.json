@@ -1,8 +1,9 @@
 {
   "name": "@manyducks.co/chatter",
   "description": "Two-way websocket RPC for Bun",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "type": "module",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/index.js",
