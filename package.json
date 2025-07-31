@@ -1,0 +1,28 @@
+{
+  "name": "@manyducks.co/chatter",
+  "description": "Two-way websocket RPC for Bun",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "dependencies": {
+    "@manyducks.co/emitter": "^1.1.2",
+    "cbor-x": "^1.6.0",
+    "lib0": "^0.2.114",
+    "uuid": "^11.1.0",
+    "zod": "^3.25.76",
+    "zod-validation-error": "^3.5.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.19",
+    "@types/node": "^24.1.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4"
+  }
+}
