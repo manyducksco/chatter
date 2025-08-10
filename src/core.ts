@@ -1,5 +1,5 @@
+import { type StandardSchemaV1, standardValidate } from "./standard";
 import { decoding, encoding } from "lib0";
-import { input, type ZodType } from "zod";
 import { Decoder, Encoder, type Options } from "cbor-x";
 
 const cborOptions: Options = {
@@ -10,53 +10,121 @@ const cborOptions: Options = {
 const cborEnc = new Encoder(cborOptions);
 const cborDec = new Decoder(cborOptions);
 
-export function createIdGenerator() {
-  let n = 0;
-  return () => {
-    n = (n + 1) % Number.MAX_SAFE_INTEGER;
-    return n.toString(36);
-  };
+export class AckIdGenerator {
+  #n = 0;
+
+  next(): string {
+    this.#n = (this.#n + 1) % Number.MAX_SAFE_INTEGER;
+    return this.#n.toString(36);
+  }
 }
 
-export type ProcDefinition = { input?: ZodType; output?: ZodType };
-export type ProcMap = Record<string, ProcDefinition>;
-
-export interface SocketSchema {
-  client: ProcMap;
-  server: ProcMap;
+export interface AckListener<O = any> {
+  proc: Proc<any, O>;
+  resolve(output: O): void;
+  reject(error: Error): void;
 }
 
-export function createSchema<S extends SocketSchema>(schema: S) {
-  return schema;
-}
-
-export interface SocketConfig<S extends SocketSchema> {
-  schema: S;
-
+export interface ProcSchema<I, O> {
   /**
-   * Default time to wait for an acknowledgement before rejecting the promise as a timeout.
-   * Defaults to 5 seconds (5,000ms).
+   * What the proc function should receive.
    */
-  defaultTimeout?: number;
+  takes?: StandardSchemaV1<I>;
 
   /**
-   * Logs incoming and outgoing messages and timings when true. Defaults to `false`.
+   * What the proc function should return.
    */
-  verbose?: boolean;
+  returns?: StandardSchemaV1<O>;
 }
 
-export interface ProcedureOptions {
+/**
+ * Configuration object passed to the Proc constructor.
+ */
+export interface ProcConfig<I, O> extends ProcSchema<I, O> {
   /**
-   * Amount of milliseconds to wait for acknowledgement before rejecting the promise.
-   * Uses the client/server's defaultTimeout value if not specified.
+   * A unique name for this proc.
+   */
+  name: string;
+
+  /**
+   * Time to wait before considering this call a failure.
+   * Value in milliseconds. Default 5000 (5 seconds).
    */
   timeout?: number;
 }
 
-export type ProcedureMethod<O extends ProcDefinition> = (
-  input: O["input"] extends undefined ? void : input<Exclude<O["input"], undefined>>,
-  options?: ProcedureOptions,
-) => Promise<O["output"] extends undefined ? void : input<Exclude<O["output"], undefined>>>;
+/**
+ * Infers the input value type based on a Proc schema.
+ */
+export type ProcInput<T extends ProcSchema<any, any>> =
+  T["takes"] extends StandardSchemaV1<any, any>
+    ? StandardSchemaV1.InferOutput<T["takes"]>
+    : null;
+
+/**
+ * Infers the handler return value type based on a Proc schema.
+ */
+export type ProcOutput<T extends ProcSchema<any, any>> =
+  T["returns"] extends StandardSchemaV1<any, any>
+    ? StandardSchemaV1.InferOutput<T["returns"]>
+    : void;
+
+export type MaybePromise<T> = T | Promise<T>;
+
+export function createProc<Config extends ProcConfig<any, any>>(
+  config: Config
+): Proc<ProcInput<Config>, ProcOutput<Config>> {
+  return new Proc(config) as any;
+}
+
+/**
+ * An abstract definition of a procedure that can be implemented or called.
+ */
+export class Proc<I, O> {
+  readonly name: string;
+  readonly schema: ProcSchema<I, O>;
+  readonly timeout: number;
+
+  constructor(config: ProcConfig<I, O>) {
+    this.name = config.name;
+    this.schema = config as any;
+    this.timeout = config.timeout ?? 5000;
+  }
+
+  /**
+   * Parses potential input for this procedure. Rejects if input doesn't match the schema.
+   */
+  async parseInput(value: any): Promise<I> {
+    if (this.schema.takes == null) {
+      return null as I;
+    } else {
+      return standardValidate(this.schema.takes, value);
+    }
+  }
+
+  /**
+   * Parses potential output from this procedure. Rejects if output doesn't match the schema.
+   */
+  async parseOutput(value: any): Promise<O> {
+    if (this.schema.returns == null) {
+      return null as O;
+    } else {
+      return standardValidate(this.schema.returns, value);
+    }
+  }
+}
+
+export interface Impl<Handler> {
+  proc: Proc<any, any>;
+  handler: Handler;
+}
+
+/**
+ * Represents a link from client->server or server->client.
+ */
+export interface Connection {
+  call<I, O>(proc: Proc<I, O>, input: I): Promise<O>;
+}
 
 export enum MessageType {
   Ping = 0,
@@ -89,15 +157,15 @@ function _encodeData(encoder: encoding.Encoder, data: unknown) {
   }
 }
 
-export function encodeProcedure<M extends ProcMap, K extends keyof M>(
+export function encodeProcedure<I>(
+  proc: Proc<I, any>,
   ackId: string,
-  name: K,
-  input: M[K]["input"],
+  input: I
 ): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeUint8(encoder, MessageType.Procedure);
   encoding.writeVarString(encoder, ackId);
-  encoding.writeVarString(encoder, name as string);
+  encoding.writeVarString(encoder, proc.name);
   _encodeData(encoder, input);
   return encoding.toUint8Array(encoder);
 }
@@ -107,7 +175,7 @@ export function decodeProcedure(message: Uint8Array) {
   const type = decoding.readUint8(decoder);
   if (type !== MessageType.Procedure) {
     throw new TypeError(
-      `Message cannot be decoded as a procedure call. Expected type ${MessageType.Procedure} but got ${type}`,
+      `Message cannot be decoded as a procedure call. Expected type ${MessageType.Procedure} but got ${type}`
     );
   }
   const ackId = decoding.readVarString(decoder);
@@ -137,7 +205,11 @@ export function decodeProcedure(message: Uint8Array) {
   }
 }
 
-export function encodeAck(ackId: string, success: boolean, output: any): Uint8Array {
+export function encodeAck(
+  ackId: string,
+  success: boolean,
+  output: any
+): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeUint8(encoder, MessageType.Ack);
   encoding.writeVarString(encoder, ackId);
@@ -149,7 +221,9 @@ export function encodeAck(ackId: string, success: boolean, output: any): Uint8Ar
       output = output.message;
     }
     if (typeof output !== "string") {
-      throw new Error(`Output should be an error message if success is false. Got: ${output}`);
+      throw new Error(
+        `Output should be an error message if success is false. Got: ${output}`
+      );
     }
     encoding.writeVarString(encoder, output);
   }
@@ -162,7 +236,7 @@ export function decodeAck(message: Uint8Array) {
   const type = decoding.readUint8(decoder);
   if (type !== MessageType.Ack) {
     throw new TypeError(
-      `Message cannot be decoded as an acknowledgement. Expected type ${MessageType.Ack} but got ${type}`,
+      `Message cannot be decoded as an acknowledgement. Expected type ${MessageType.Ack} but got ${type}`
     );
   }
   const ackId = decoding.readVarString(decoder);
@@ -214,7 +288,9 @@ export function decodePing(message: Uint8Array): string {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
   if (type !== MessageType.Ping) {
-    throw new TypeError(`Message is not a ping. Expected type ${MessageType.Ping}, but got ${type}`);
+    throw new TypeError(
+      `Message is not a ping. Expected type ${MessageType.Ping}, but got ${type}`
+    );
   }
   return decoding.readVarString(decoder);
 }
@@ -225,7 +301,10 @@ export function decodePing(message: Uint8Array): string {
  * @param message - The binary message.
  * @param callback - If passed, the decoded object will be passed to this function instead of console.log()
  */
-export function printMessage(message: Uint8Array, callback?: (data: any) => void) {
+export function printMessage(
+  message: Uint8Array,
+  callback?: (data: any) => void
+) {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
 

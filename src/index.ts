@@ -1,3 +1,3 @@
-export { ConnectionState, createClient, type SocketClient, type SocketClientConfig } from "./client";
-export { createSchema, type SocketSchema } from "./core";
-export { createServer, type SocketServer, type SocketServerConfig, type SocketServerClient } from "./server";
+export { createProc, type Proc, ProcConfig, ProcSchema } from "./core";
+export * from "./client";
+export * from "./server";

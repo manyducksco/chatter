@@ -1,236 +1,332 @@
-import { input } from "zod";
+import { v7 } from "uuid";
 import {
-  createIdGenerator,
+  AckIdGenerator,
+  AckListener,
+  Connection,
   decodeAck,
   decodePing,
   decodeProcedure,
   encodeAck,
-  encodePing,
   encodeProcedure,
   getMessageType,
+  Impl,
   MessageType,
   printMessage,
-  type ProcDefinition,
-  type ProcedureOptions,
-  type ProcMap,
-  type SocketConfig,
-  type SocketSchema,
+  Proc,
 } from "./core";
-import { Debouncer } from "./debouncer";
+
+/**
+ * Takes the procedure's input data and a socket object.
+ * The `connection` represents a link to the server.
+ */
+export type ClientProcHandler<I, O> = (
+  input: I,
+  connection: Connection
+) => O | Promise<O>;
+
+export interface ClientConfig {
+  /**
+   * Chatter server URL.
+   */
+  url: string | URL;
+
+  /**
+   * Enables extra logging when true.
+   */
+  verbose?: boolean;
+}
 
 export enum ConnectionState {
-  Online,
   Offline,
+  Connecting,
+  Online,
 }
 
-export type SocketClient<S extends SocketSchema> = {
-  readonly connectionState: ConnectionState;
-  onConnectionStateChanged: (
-    callback: (state: ConnectionState) => void
-  ) => () => void;
+const noop = () => undefined;
+const CLIENT_ID_KEY = "chatter.clientId";
 
-  /**
-   * Call a procedure on the server.
-   */
-  call<P extends keyof S["server"]>(
-    name: P,
-    input: S["server"][P]["input"] extends undefined
-      ? undefined
-      : input<Exclude<S["server"][P]["input"], undefined>>,
-    options?: ProcedureOptions
-  ): Promise<
-    S["server"][P]["output"] extends undefined
-      ? undefined
-      : input<Exclude<S["server"][P]["output"], undefined>>
-  >;
-};
-//& { [K in keyof S["server"]]: ProcedureMethod<S["server"][K]> };
-
-export type ClientProcedure<D extends ProcDefinition> = (
-  input: D["input"] extends undefined
-    ? void
-    : input<Exclude<D["input"], undefined>>
-) =>
-  | Promise<
-      D["output"] extends undefined
-        ? void
-        : input<Exclude<D["output"], undefined>>
-    >
-  | (D["output"] extends undefined
-      ? void
-      : input<Exclude<D["output"], undefined>>);
-
-export interface SocketClientConfig<S extends SocketSchema, P extends ProcMap>
-  extends SocketConfig<S> {
-  url: string;
-  procedures: {
-    [K in keyof P]: ClientProcedure<P[K]>;
-  };
-  /**
-   * Time to wait (in milliseconds) after the last message to send a ping.
-   * Defaults to `30000` (30 seconds).
-   */
-  pingInterval?: number;
-}
-
-const noop = () => {};
-
-export function createClient<S extends SocketSchema>(
-  config: SocketClientConfig<S, S["client"]>
-): SocketClient<S> {
-  let socket!: WebSocket;
-  let reconnectAttempts = 0;
-  let reconnectTimeout: any;
-  let connectionState = ConnectionState.Offline;
-  const connectionStateChangeListeners: ((state: ConnectionState) => void)[] =
-    [];
-
-  const defaultTimeout = config.defaultTimeout ?? 5000;
-  const getId = createIdGenerator();
-
-  const debug = {
+function createLogger(verbose = false) {
+  return {
     get log() {
-      if (!config.verbose) return noop;
+      if (!verbose) return noop;
       return console.log.bind(console, "[chatter]");
     },
     get warn() {
-      if (!config.verbose) return noop;
+      if (!verbose) return noop;
       return console.warn.bind(console, "[chatter]");
     },
     get error() {
-      if (!config.verbose) return noop;
+      if (!verbose) return noop;
       return console.error.bind(console, "[chatter]");
     },
   };
+}
 
-  // Acknowledgements the client is waiting on from the server.
-  const ackListeners = new Map<string, AckListener>();
-  interface AckListener {
-    proc: string;
-    resolve: (output: any) => void;
-    reject: (error: Error) => void;
+type Logger = ReturnType<typeof createLogger>;
+
+export function createClient(config: ClientConfig): ChatterClient {
+  return new ChatterClient(config);
+}
+
+class ChatterClient implements Connection {
+  #config: ClientConfig;
+  #clientId = this.#getClientId();
+
+  #state = ConnectionState.Offline;
+  #stateChangeCallbacks = new Set<(state: ConnectionState) => void>();
+
+  #procs = new Map<string, Impl<ClientProcHandler<any, any>>>();
+
+  #socket!: WebSocket;
+  #reconnectAttempts = 0;
+  #reconnectTimeout: any;
+
+  #ids = new AckIdGenerator();
+  #acks = new Map<string, AckListener>();
+
+  #debug: Logger;
+
+  constructor(config: ClientConfig) {
+    this.#config = config;
+    this.#debug = createLogger(config.verbose);
+
+    document.addEventListener("visibilitychange", this.#onVisibilityChange);
+    document.addEventListener("online", this.#onNetworkChange);
+    document.addEventListener("offline", this.#onNetworkChange);
+
+    // Create initial connection.
+    this.#connect();
   }
 
-  const ping = new Debouncer(config.pingInterval ?? 30_000, () => {
-    let timeout: any;
-    new Promise((resolve, reject) => {
-      // 10 second timeout
-      timeout = setTimeout(() => {
-        reject(new Error("Ping timed out."));
-      }, 10_000);
-      const ackId = getId();
-      ackListeners.set(ackId, { proc: "@ping", resolve, reject });
-      socket.send(encodePing(ackId));
-    })
-      .then(() => {
-        // Connection is still online. Check again in 60 seconds.
-        ping.queue();
-      })
-      .catch((error) => {
-        debug.error(error);
-      })
-      .finally(() => {
-        clearTimeout(timeout);
-        updateConnectionState();
-      });
-  });
+  /**
+   * The current connection state.
+   */
+  get state() {
+    return this.#state;
+  }
 
-  function connect() {
-    clearTimeout(reconnectTimeout);
-    reconnectTimeout = null;
+  /**
+   * Persistent client ID.
+   */
+  get clientId() {
+    return this.#clientId;
+  }
+
+  /**
+   * Registers a callback to run when the `state` value changes.
+   * Returns a function that stops listening for changes.
+   */
+  onStateChange(callback: (state: ConnectionState) => void) {
+    this.#stateChangeCallbacks.add(callback);
+    return () => this.#stateChangeCallbacks.delete(callback);
+  }
+
+  /**
+   * Implements a `Proc` so it can be called from the other end of the connection.
+   */
+  on<I, O>(proc: Proc<I, O>, handler: ClientProcHandler<I, O>) {
+    if (this.#procs.has(proc.name)) {
+      console.warn(
+        `Procedure '${proc.name}' has already been added and will be overwritten!`
+      );
+    }
+    this.#procs.set(proc.name, { proc, handler });
+  }
+
+  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O> {
+    const parsedInput = await proc.parseInput(input);
+
+    if (this.#socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Socket is not open.");
+    }
+
+    let timer: any;
+    const waitTime = proc.timeout;
+
+    return new Promise<O>((resolve, reject) => {
+      // Configure timeout
+      timer = setTimeout(() => {
+        reject(new Error(`Procedure call timed out after ${waitTime}ms.`));
+      }, waitTime);
+
+      // Send over socket, await acknowledgement
+      const startTime = Date.now();
+      const ackId = this.#ids.next();
+      this.#acks.set(ackId, {
+        proc,
+        resolve: (output) => {
+          this.#debug.log("call succeeded", {
+            ackId,
+            name: proc.name,
+            input: parsedInput,
+            output,
+            elapsed: Date.now() - startTime,
+          });
+          resolve(output);
+        },
+        reject: (error) => {
+          this.#debug.warn("call failed", {
+            ackId,
+            name: proc.name,
+            input: parsedInput,
+            error,
+            elapsed: Date.now() - startTime,
+          });
+          reject(error);
+        },
+      });
+      this.#socket.send(encodeProcedure(proc, ackId, parsedInput));
+    }).finally(() => {
+      clearTimeout(timer);
+    });
+  }
+
+  /*===============================*\
+  ||           Internal            ||
+  \*===============================*/
+
+  #getClientId() {
+    let stored = localStorage.getItem(CLIENT_ID_KEY);
+    if (!stored) {
+      stored = v7();
+      localStorage.setItem(CLIENT_ID_KEY, stored);
+    }
+    return stored;
+  }
+
+  #connect() {
+    clearTimeout(this.#reconnectTimeout);
+    this.#reconnectTimeout = null;
 
     // No-op if already connected.
-    if (socket) {
-      if (socket.readyState === WebSocket.OPEN) {
-        return setConnectionState(ConnectionState.Online);
+    if (this.#socket) {
+      if (this.#socket.readyState === WebSocket.OPEN) {
+        return this.#setConnectionState(ConnectionState.Online);
       }
-      socket.close();
+      this.#socket.close();
     }
 
-    socket = new WebSocket(config.url);
-    socket.binaryType = "arraybuffer";
-    socket.addEventListener("open", onOpen);
-    socket.addEventListener("close", onClose);
-    socket.addEventListener("message", onMessage);
-    socket.addEventListener("error", onError);
+    this.#socket = new WebSocket(this.#config.url);
+    this.#socket.binaryType = "arraybuffer";
+    this.#socket.addEventListener("open", this.#onOpen);
+    this.#socket.addEventListener("close", this.#onClose);
+    this.#socket.addEventListener("message", this.#onMessage);
+    this.#socket.addEventListener("error", this.#onError);
   }
 
-  function tryReconnect() {
-    if (reconnectTimeout == null) {
-      // Reconnect with exponential backoff (max 30 seconds)
-      const delay = Math.min(1000 * 2 ** reconnectAttempts++, 30000);
-      reconnectTimeout = setTimeout(connect, delay);
-
-      if (reconnectAttempts > 0) {
-        debug.log(
-          `Attempting socket reconnection in ${delay / 1000} seconds (attempt ${reconnectAttempts}).`
-        );
-      } else {
-        debug.log(`Attempting socket connection.`);
-      }
-    }
-  }
-
-  function setConnectionState(state: ConnectionState) {
-    if (state !== connectionState) {
-      connectionState = state;
-      for (const callback of connectionStateChangeListeners) {
+  #setConnectionState(state: ConnectionState) {
+    if (state !== this.#state) {
+      this.#state = state;
+      for (const callback of this.#stateChangeCallbacks) {
         callback(state);
       }
 
-      if (connectionState === ConnectionState.Offline) {
+      if (this.#state === ConnectionState.Offline) {
         // Reject all pending listeners.
-        for (const [id, listener] of Array.from(ackListeners.entries())) {
+        for (const [id, listener] of Array.from(this.#acks.entries())) {
           listener.reject(new Error(`Socket disconnected.`));
-          ackListeners.delete(id);
+          this.#acks.delete(id);
         }
       }
     }
   }
 
-  function updateConnectionState() {
-    if (socket.readyState === WebSocket.OPEN) {
-      setConnectionState(ConnectionState.Online);
+  #updateConnectionState() {
+    switch (this.#socket.readyState) {
+      case WebSocket.CLOSED:
+      case WebSocket.CLOSING:
+        this.#setConnectionState(ConnectionState.Offline);
+        break;
+      case WebSocket.OPEN:
+        this.#setConnectionState(ConnectionState.Online);
+        break;
+      case WebSocket.CONNECTING:
+        this.#setConnectionState(ConnectionState.Connecting);
+        break;
+    }
+  }
+
+  #tryReconnect() {
+    if (this.#reconnectTimeout != null) return;
+
+    // Reconnect with exponential backoff (max 30 seconds)
+    const delay = Math.min(1000 * 2 ** this.#reconnectAttempts++, 30000);
+    this.#reconnectTimeout = setTimeout(() => this.#connect(), delay);
+
+    if (this.#reconnectAttempts > 0) {
+      this.#debug.log(
+        `Attempting socket reconnection in ${delay / 1000} seconds (attempt ${this.#reconnectAttempts}).`
+      );
     } else {
-      setConnectionState(ConnectionState.Offline);
+      this.#debug.log(`Attempting socket connection.`);
     }
   }
 
-  function beforeUnload() {
+  // ----- Page Events ----- //
+
+  #beforeUnload = () => {
     // Graceful shutdown if the user leaves the page.
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.close(1000, "App unloaded");
+    if (this.#socket.readyState === WebSocket.OPEN) {
+      this.#socket.close(1000, "App unloaded");
     }
-  }
+  };
 
-  function onOpen(event: Event) {
-    // debug.log("event: open", event);
-    debug.log("Socket connected.");
+  #onVisibilityChange = () => {
+    if (
+      this.#socket.readyState !== WebSocket.OPEN &&
+      document.visibilityState === "visible"
+    ) {
+      this.#connect();
+    }
+  };
 
-    updateConnectionState();
-    window.addEventListener("beforeunload", beforeUnload);
-    reconnectAttempts = 0;
-    // clearTimeout(reconnectTimeout);
+  #onNetworkChange = () => {
+    if (navigator.onLine) {
+      this.#connect();
+    } else {
+      // TODO: Disconnect?
+    }
+  };
 
-    ping.queue();
-  }
+  // ----- Socket Events ----- //
 
-  function onClose(event: CloseEvent) {
-    // debug.log("event: close", event);
-    debug.warn("Socket closed.");
+  #onOpen = (event: Event) => {
+    this.#debug.log("Socket connected.");
 
-    updateConnectionState();
-    window.removeEventListener("beforeunload", beforeUnload);
+    this.#updateConnectionState();
+    window.addEventListener("beforeunload", this.#beforeUnload);
+    this.#reconnectAttempts = 0;
 
-    ping.cancel();
+    // TODO: Ping
+  };
 
-    tryReconnect();
-  }
+  #onClose = (event: CloseEvent) => {
+    this.#debug.warn("Socket closed.");
 
-  async function onMessage(event: MessageEvent) {
-    // All messages are encoded as Uint8Arrays.
+    this.#updateConnectionState();
+    window.removeEventListener("beforeunload", this.#beforeUnload);
+
+    // TODO: Cancel ping
+
+    this.#tryReconnect();
+  };
+
+  #onError = (event: Event) => {
+    event.preventDefault();
+
+    this.#debug.error("Socket error", event);
+
+    this.#updateConnectionState();
+    window.removeEventListener("beforeunload", this.#beforeUnload);
+
+    // TODO: Cancel ping
+
+    this.#tryReconnect();
+  };
+
+  #onMessage = (event: MessageEvent) => {
     if (!(event.data instanceof ArrayBuffer)) {
-      debug.warn(
+      this.#debug.warn(
         `Message data was not an ArrayBuffer. Ignoring message.`,
         event
       );
@@ -239,207 +335,104 @@ export function createClient<S extends SocketSchema>(
     const message = new Uint8Array(event.data);
 
     // Push back ping when we receive a message; we know the connection is alive.
-    ping.queue();
-    updateConnectionState();
+    // ping.queue();
+    this.#updateConnectionState();
 
-    if (config.verbose) {
+    if (this.#config.verbose) {
       printMessage(message, (data) => {
-        debug.log("received message", data);
+        this.#debug.log("received message", data);
       });
     }
 
     switch (getMessageType(message)) {
-      case MessageType.Procedure: {
-        const proc = decodeProcedure(message);
-        const handler = config.procedures[proc.name];
-        const schema = config.schema.client[proc.name];
-        let input;
-        if (schema.input) {
-          try {
-            input = schema.input.parse(proc.input);
-          } catch (error) {
-            // Acknowledge failure
-            socket.send(encodeAck(proc.ackId, false, error));
-          }
-        }
-
-        // Empty ackId is a broadcast. No acknowledgement needed.
-        if (proc.ackId === "") {
-          await handler(input as any);
-          debug.log("received broadcast", { name: proc.name, input });
-          break;
-        }
-
-        let output;
-        try {
-          output = await handler(input as any);
-          if (schema.output) {
-            try {
-              const data = schema.output.parse(output);
-              socket.send(encodeAck(proc.ackId, true, data));
-              debug.log("received call", {
-                ackId: proc.ackId,
-                name: proc.name,
-                input: data,
-              });
-            } catch (error) {
-              socket.send(encodeAck(proc.ackId, false, error));
-              debug.log("received call", {
-                ackId: proc.ackId,
-                name: proc.name,
-                error,
-              });
-            }
-          } else {
-            socket.send(encodeAck(proc.ackId, true, undefined));
-            debug.log("received call", {
-              ackId: proc.ackId,
-              name: proc.name,
-              input,
-              output: undefined,
-            });
-          }
-        } catch (error) {
-          // Acknowledge failure
-          socket.send(encodeAck(proc.ackId, false, error));
-        }
-
-        break;
-      }
-      case MessageType.Ack: {
-        const { ackId, success, output, error } = decodeAck(message);
-
-        const listener = ackListeners.get(ackId);
-        if (listener) {
-          if (success) {
-            const outputSchema = config.schema.server[listener.proc]?.output;
-            if (outputSchema) {
-              const { success, data, error } = outputSchema.safeParse(output);
-              if (success) {
-                listener.resolve(data);
-              } else {
-                listener.reject(error);
-              }
-            } else {
-              listener.resolve(undefined);
-            }
-          } else {
-            console.warn(error);
-            listener.reject(new Error(error));
-          }
-          ackListeners.delete(ackId);
-        } else {
-          // TODO: Handle acknowledgement for a message that wasn't waiting on one. Warn?
-        }
-        break;
-      }
-      case MessageType.Ping: {
-        const ackId = decodePing(message);
-        socket.send(encodeAck(ackId, true, undefined));
-        break;
-      }
+      case MessageType.Procedure:
+        return this.#handleProcedure(message);
+      case MessageType.Ack:
+        return this.#handleAck(message);
+      case MessageType.Ping:
+        return this.#handlePing(message);
     }
-  }
+  };
 
-  function onError(event: Event) {
-    event.preventDefault();
-
-    debug.error("event: error", event);
-
-    updateConnectionState();
-    window.removeEventListener("beforeunload", beforeUnload);
-
-    ping.cancel();
-
-    tryReconnect();
-  }
-
-  // Handle reconnection when someone comes back to the app.
-  function onVisibilityChange(_: Event) {
-    if (
-      document.visibilityState === "visible" &&
-      socket.readyState !== WebSocket.OPEN
-    ) {
-      connect();
+  async #handleProcedure(message: Uint8Array) {
+    const decoded = decodeProcedure(message);
+    const impl = this.#procs.get(decoded.name);
+    if (!impl) {
+      // Respond with an error.
+      this.#socket.send(
+        encodeAck(
+          decoded.ackId,
+          false,
+          `No implementation for proc '${decoded.name}'`
+        )
+      );
+      return;
     }
-  }
-  document.addEventListener("visibilitychange", onVisibilityChange);
 
-  function onNetworkChange(_: Event) {
-    if (navigator.onLine) {
-      connect();
-    } else {
-      // TODO: Disconnect?
-    }
-  }
-  window.addEventListener("online", onNetworkChange);
-  window.addEventListener("offline", onNetworkChange);
-
-  // Create initial connection.
-  connect();
-
-  return {
-    get connectionState() {
-      return connectionState;
-    },
-    onConnectionStateChanged(callback: (state: ConnectionState) => void) {
-      connectionStateChangeListeners.push(callback);
-      return () => {
-        connectionStateChangeListeners.splice(
-          connectionStateChangeListeners.indexOf(callback),
-          1
-        );
-      };
-    },
-    async call(name: string, input, options) {
-      if (socket.readyState !== WebSocket.OPEN) {
-        throw new Error("Socket is not open.");
-      }
-
-      const inputSchema = config.schema.server[name].input;
-
-      // Parse input data with schema before sending. If no schema is provided, no data is passed.
-      let inputData: any;
-      if (inputSchema) {
-        inputData = inputSchema.parse(input);
-      }
-
-      const timeoutMs = options?.timeout ?? defaultTimeout;
-      let timeout: any;
-
-      return new Promise((resolve, reject) => {
-        timeout = setTimeout(() => {
-          reject(new Error(`Procedure call timed out after ${timeoutMs}ms.`));
-        }, timeoutMs);
-        const startTime = Date.now();
-        const ackId = getId();
-        ackListeners.set(ackId, {
-          proc: name,
-          resolve: (output) => {
-            debug.log("call succeeded", {
-              ackId,
-              name,
-              input: inputData,
-              output,
-              elapsed: Date.now() - startTime,
-            });
-            resolve(output);
-          },
-          reject: (error) => {
-            debug.warn("call failed", {
-              ackId,
-              name,
-              input: inputData,
-              error,
-              elapsed: Date.now() - startTime,
-            });
-            reject(error);
-          },
+    // Empty ackId is a broadcast. No acknowledgement needed.
+    if (decoded.ackId === "") {
+      try {
+        const parsedInput = await impl.proc.parseInput(decoded.input);
+        await impl.handler(parsedInput, this);
+        this.#debug.log("received broadcast", {
+          name: decoded.name,
+          input: parsedInput,
         });
-        socket.send(encodeProcedure(ackId, name, inputData));
-      }).finally(() => {
-        clearTimeout(timeout);
-      });
-    },
-  } as SocketClient<S>;
+      } catch (error) {
+        this.#debug.warn("error while handling a broadcast", error);
+      }
+
+      return;
+    }
+
+    this.#debug.log("received call", {
+      ackId: decoded.ackId,
+      name: decoded.name,
+      input: decoded.input,
+    });
+
+    // Handle as a normal procedure call.
+    try {
+      const parsedInput = await impl.proc.parseInput(decoded.input);
+      const output = await impl.handler(parsedInput, this);
+      // TODO: Crash on client if output parsing fails.
+      const parsedOutput = await impl.proc.parseOutput(output);
+      this.#socket.send(encodeAck(decoded.ackId, true, parsedOutput));
+    } catch (error) {
+      this.#socket.send(encodeAck(decoded.ackId, false, error));
+    }
+  }
+
+  async #handleAck(message: Uint8Array) {
+    const decoded = decodeAck(message);
+    const listener = this.#acks.get(decoded.ackId);
+    if (!listener) {
+      // Received unexpected acknowledgement.
+      return;
+    }
+
+    if (decoded.success) {
+      try {
+        const parsedOutput = await listener.proc.parseOutput(decoded.output);
+        listener.resolve(parsedOutput);
+      } catch (error) {
+        if (error instanceof Error) {
+          listener.reject(error as Error);
+        } else {
+          listener.reject(new Error(`Unknown error: ${error}`));
+        }
+      }
+    } else {
+      if ((decoded.output as any) instanceof Error) {
+        listener.reject(decoded.output as any as Error);
+      } else {
+        listener.reject(new Error(decoded.output));
+      }
+    }
+  }
+
+  #handlePing(message: Uint8Array) {
+    const ackId = decodePing(message);
+    this.#socket.send(encodeAck(ackId, true, null));
+  }
 }

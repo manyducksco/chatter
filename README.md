@@ -1,94 +1,114 @@
 # Chatter
 
-Chatter is a two-way RPC system built on Bun websockets. You implement procedures (remote functions), then call those functions from the other end of a websocket connection. Once the socket conection is established the server can call the client's procedures and the client can call the server's procedures.
+Chatter is a two-way RPC system built on Bun websockets. Define your remote procedures in a central location, implement them on either the client or the server, and call them from the other side with full TypeScript support.
 
-Type inference and validation is handled with Zod.
+Type inference and validation is based on [Standard Schema](https://standardschema.dev/), so your schemas can come from any library you prefer.
 
-```js
-// ... in schema.js ...
+## Features
 
-import { createSchema } from "@manyducks.co/chatter";
+- 🌐 **Two-Way RPC**: Procedures can be implemented on the server and called by the client, or vice-versa.
+
+- 🔒 **Bring Your Own Schema Library**: Type-safe by design. Compatible with any validation library that adheres to the Standard Schema interface, like Zod, Valibot, ArkType, and more.
+
+- 📢 **Pub/Sub System**: Built-in support for broadcasting messages to groups of clients using topics.
+
+- 🔌 **Resilient Client**: The client automatically handles reconnects with exponential backoff.
+
+- 🚀 **Efficient**: Uses a fast binary messaging format (CBOR) for low-latency communication.
+
+---
+
+## Installation
+
+First, install Chatter and your schema library of choice.
+
+```bash
+# With Zod (recommended)
+npm install @manyducks.co/chatter zod
+
+# Or with Valibot
+npm install @manyducks.co/chatter valibot
+```
+
+---
+
+## Quick Start
+
+### 1\. Define a Procedure
+
+Create a shared file to define your procedures. By convention, procedures are named in `SCREAMING_SNAKE_CASE`. This example uses **Zod**, but any compatible library will work.
+
+```typescript
+// src/procedures.ts
+import { createProc } from "@manyducks.co/chatter";
 import { z } from "zod";
 
-// Client and server share one schema where all procedures are defined.
-export const schema = createSchema({
-  server: {
-    // The server will implement these procedures for the client to call
-    joinRoom: {
-      input: z.object({
-        roomId: z.string(),
-        username: z.string(),
-      }),
-    },
-    sendMessage: {
-      input: z.object({
-        roomId: z.string(),
-        message: z.string(),
-      }),
-    },
-  },
-  client: {
-    // The client will implement these procedures for the server to call
-    receiveMessage: {
-      roomId: z.string(),
-      username: z.string(),
-      message: z.string(),
-    },
-  },
-});
-
-// ... in server.js ...
-
-import { createServer } from "@manyducks.co/chatter";
-import { schema } from "./schema.js";
-
-// The server implements the server procedures.
-const server = createServer({
-  schema,
-  procedures: {
-    joinRoom(input, client) {
-      client.subscribe(input.roomId);
-      client.set("username", input.username);
-    },
-    sendMessage(input, client) {
-      client.publish(input.roomId, "receiveMessage", {
-        roomId: input.roomId,
-        username: client.get("username"),
-        message: input.message,
-      });
-    },
-  },
-});
-
-// Bun.serve handles the websocket upgrade with the server acting as a websocket handler.
-Bun.serve({
-  fetch(req) {
-    // upgrade the request to a WebSocket
-    if (server.upgrade(req)) {
-      return; // do not return a Response
-    }
-    return new Response("Upgrade failed", { status: 500 });
-  },
-  websocket: server.handler,
-  port: 5000,
-});
-
-// ... in client.js ...
-
-import { createClient } from "@manyducks.co/chatter";
-import { schema } from "./schema.js";
-
-const socket = createClient({
-  url: "ws://localhost:5000",
-  schema,
-  procedures: {
-    // ... client procedures ...
-  },
-});
-
-// Call a server procedure from the client. Resolves to whatever the procedure returned on the server side.
-const message = await socket.call("joinRoom", {
-  roomId: 1,
-  username: "schwingbat",
+export const GREET = createProc({
+  // A unique name for the procedure
+  name: "greet",
+  // The schema for the input value
+  takes: z.string(),
+  // The schema for the return value
+  returns: z.string(),
 });
 ```
+
+### 2\. Implement on the Server
+
+Create a Bun server and implement the `GREET` procedure.
+
+```typescript
+// src/server.ts
+import { createServer } from "@manyducks.co/chatter";
+import { GREET } from "./procedures";
+
+const chatter = createServer();
+
+// Implement the GREET procedure
+chatter.on(GREET, async (name) => {
+  console.log(`Received greeting for: ${name}`);
+  return `Hello ${name}. This message is from the server!`;
+});
+
+// Start the Bun server
+Bun.serve({
+  port: 3000,
+  fetch(req, server) {
+    if (server.upgrade(req)) {
+      return; // Bun handles the response
+    }
+    return new Response("Upgrade failed :(", { status: 500 });
+  },
+  // Chatter handles the websockets
+  websocket: chatter.websocket,
+});
+
+console.log("Chatter server listening on port 3000");
+```
+
+### 3\. Call from the Client
+
+Finally, create a client that connects to the server and calls the procedure.
+
+```typescript
+// src/client.ts
+import { createClient, ConnectionState } from "@manyducks.co/chatter";
+import { GREET } from "./procedures";
+
+const client = createClient({
+  url: "ws://localhost:3000",
+});
+
+client.onStateChange(async (state) => {
+  if (state === ConnectionState.Online) {
+    // Once connected, call the server's procedure
+    const response = await client.call(GREET, "World");
+    console.log("Server responded:", response);
+    // -> Server responded: Hello World. This message is from the server!
+  }
+});
+```
+
+---
+
+[That's a lot of ducks.](https://www.manyducks.co)

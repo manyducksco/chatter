@@ -1,306 +1,399 @@
-import { input } from "zod";
-import { fromZodError } from "zod-validation-error";
 import {
-  type ProcedureOptions,
-  type SocketConfig,
-  type SocketSchema,
-  createIdGenerator,
+  AckIdGenerator,
+  AckListener,
+  Connection,
   decodeAck,
   decodePing,
   decodeProcedure,
   encodeAck,
   encodeProcedure,
   getMessageType,
+  Impl,
+  MaybePromise,
   MessageType,
-  printMessage,
+  Proc,
 } from "./core";
-import { Emitter, EventMap } from "@manyducks.co/emitter";
 
-export type ClientData = Record<string, any>;
+/**
+ * Takes the procedure's input data and a socket object.
+ * The `connection` represents a link to the client.
+ */
+export type ServerProcHandler<I, O, Data> = (
+  input: I,
+  connection: ServerConnection<Data>
+) => MaybePromise<O>;
 
-interface ServerEvents<S extends SocketSchema> extends EventMap {
-  connect: [SocketServerClient<S>];
-  disconnect: [SocketServerClient<S>];
+interface BroadcastOptions {
+  exclude?: ServerConnection<any>[];
 }
 
-export type SocketServer<S extends SocketSchema> = {
-  handler: Bun.WebSocketHandler<any>;
-  events: Emitter<ServerEvents<S>>;
-  clientsWhere: (match: (data: ClientData, index: number) => boolean) => SocketServerClient<S>[];
-  publish<P extends keyof S["client"]>(
-    topic: string,
-    name: P,
-    input: S["client"][P]["input"] extends undefined
-      ? undefined
-      : input<Exclude<S["client"][P]["input"], undefined>>,
-  ): void;
-};
-
-interface AckListener {
-  proc: string;
-  resolve(output: any): void;
-  reject(error: Error): void;
+interface ConnectionInfo {
+  ws: Bun.ServerWebSocket<undefined>;
 }
 
 /**
- * Represents a single websocket connection to a client.
+ * Options passed to the Server constructor.
  */
-export class SocketServerClient<S extends SocketSchema> {
-  _ws;
-  _config;
-  _ackListeners = new Map<string, AckListener>();
-  _topics = new Set<string>();
+export interface ServerOptions<Data> {
+  /**
+   * Called just after the client connects. The return value is set as the `data` field on the connection object.
+   */
+  onInit?: (info: ConnectionInfo) => Promise<Data>;
 
   /**
-   * An object to store any values you want.
-   * Can be filtered to retrieve a list of matching clients.
+   * Called just after the connection is initialized, but before it starts receiving events.
    */
-  data: ClientData = {};
+  onOpen?: (connection: ServerConnection<Data>) => void | Promise<void>;
 
-  _getId = createIdGenerator();
+  /**
+   * Called just after the connection is closed.
+   */
+  onClose?: (
+    connection: ServerConnection<Data>,
+    code: number,
+    reason: string
+  ) => void | Promise<void>;
+}
 
-  constructor(ws: Bun.ServerWebSocket<any>, config: SocketServerConfig<S>) {
-    this._ws = ws;
-    this._config = config;
+class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
+  _server: ChatterServer<ConnectionData>;
+
+  constructor(server: ChatterServer<ConnectionData>) {
+    this._server = server;
+  }
+
+  async open(ws: Bun.ServerWebSocket<undefined>) {
+    let connection: ServerConnection<ConnectionData>;
+
+    // Init client
+    const opts = this._server._options;
+    if (opts.onInit) {
+      const data = await opts.onInit({ ws });
+      connection = new ServerConnection(this._server, ws, data);
+    } else {
+      connection = new ServerConnection(this._server, ws, {} as ConnectionData);
+    }
+
+    // Ready to receive data now.
+    this._server._connections.set(ws, connection);
+
+    if (opts.onOpen) {
+      await opts.onOpen(connection);
+    }
+  }
+
+  async close(
+    ws: Bun.ServerWebSocket<undefined>,
+    code: number,
+    reason: string
+  ) {
+    // Remove client
+    const opts = this._server._options;
+    const connection = this._server._connections.get(ws);
+    if (!connection) return;
+
+    // Unsubscribe from all topics.
+    connection._topics.forEach((topic) => connection.unsubscribe(topic));
+
+    // Already disconnected, so we can stop receiving now.
+    this._server._connections.delete(ws);
+
+    if (opts.onClose) {
+      await opts.onClose(connection, code, reason);
+    }
+  }
+
+  async ping(ws: Bun.ServerWebSocket<undefined>, data: Buffer) {
+    // TODO: Mark connection as fresh.
+    ws.pong();
+  }
+
+  async pong(ws: Bun.ServerWebSocket<undefined>, data: Buffer) {
+    // TODO: Mark connection as fresh.
+  }
+
+  async drain(ws: Bun.ServerWebSocket<undefined>) {}
+
+  async message(ws: Bun.ServerWebSocket<undefined>, data: string | Buffer) {
+    const connection = this._server._connections.get(ws);
+    if (connection == null) {
+      throw new Error(`No connection found for this socket.`);
+    }
+    if (typeof data === "string") {
+      throw new Error(
+        `Expected websocket message to be a Buffer. Got: ${data}`
+      );
+    }
+    const message = new Uint8Array(data);
+
+    // Process incoming message
+    switch (getMessageType(message)) {
+      case MessageType.Procedure:
+        return this._handleProcedure(connection, message);
+      case MessageType.Ack:
+        return this._handleAck(connection, message);
+      case MessageType.Ping:
+        return this._handlePing(connection, message);
+    }
+  }
+
+  async _handleProcedure(
+    connection: ServerConnection<ConnectionData>,
+    message: Uint8Array
+  ): Promise<void> {
+    const ws = connection._ws;
+    const decoded = decodeProcedure(message);
+    const impl = this._server._procs.get(decoded.name);
+    if (!impl) {
+      // Respond with an error.
+      ws.sendBinary(
+        encodeAck(
+          decoded.ackId,
+          false,
+          `No implementation for proc '${decoded.name}'`
+        )
+      );
+      return;
+    }
+
+    try {
+      const parsedInput = await impl.proc.parseInput(decoded.input);
+      const output = await impl.handler(parsedInput, connection);
+      const parsedOutput = await impl.proc.parseOutput(output);
+      ws.sendBinary(encodeAck(decoded.ackId, true, parsedOutput));
+    } catch (error) {
+      ws.sendBinary(encodeAck(decoded.ackId, false, error));
+    }
+  }
+
+  async _handleAck(
+    connection: ServerConnection<ConnectionData>,
+    message: Uint8Array
+  ): Promise<void> {
+    const decoded = decodeAck(message);
+    const listener = connection._acks.get(decoded.ackId);
+    if (!listener) {
+      // Received unexpected acknowledgement.
+      return;
+    }
+
+    if (decoded.success) {
+      try {
+        const parsedOutput = await listener.proc.parseOutput(decoded.output);
+        listener.resolve(parsedOutput);
+      } catch (error) {
+        if (error instanceof Error) {
+          listener.reject(error as Error);
+        } else {
+          listener.reject(new Error(`Unknown error: ${error}`));
+        }
+      }
+    } else {
+      if ((decoded.output as any) instanceof Error) {
+        listener.reject(decoded.output as any as Error);
+      } else {
+        listener.reject(new Error(decoded.output));
+      }
+    }
+  }
+
+  async _handlePing(
+    connection: ServerConnection<ConnectionData>,
+    message: Uint8Array
+  ): Promise<void> {
+    const ackId = decodePing(message);
+    connection._ws.sendBinary(encodeAck(ackId, true, null));
+  }
+}
+
+export function createServer<ConnectionData>(
+  options?: ServerOptions<ConnectionData>
+): ChatterServer<ConnectionData> {
+  return new ChatterServer(options);
+}
+
+class ChatterServer<ConnectionData> {
+  readonly _options: ServerOptions<ConnectionData>;
+  readonly _connections = new Map<
+    Bun.ServerWebSocket,
+    ServerConnection<ConnectionData>
+  >();
+  readonly _procs = new Map<
+    string,
+    Impl<ServerProcHandler<any, any, ConnectionData>>
+  >();
+
+  _topicMap = new Map<string, Set<ServerConnection<ConnectionData>>>();
+
+  readonly websocket: ServerSocketHandler<ConnectionData>;
+
+  constructor(options?: ServerOptions<ConnectionData>) {
+    this._options = options ?? {};
+    this.websocket = new ServerSocketHandler(this);
   }
 
   /**
-   * Call a procedure on the client.
+   * Implements a `Proc` so it can be called from the other end of the connection.
    */
-  async call<P extends keyof S["client"]>(
-    name: P,
-    input: S["client"][P]["input"] extends undefined
-      ? undefined
-      : input<Exclude<S["client"][P]["input"], undefined>>,
-    options?: ProcedureOptions,
-  ): Promise<
-    S["client"][P]["output"] extends undefined
-      ? undefined
-      : input<Exclude<S["client"][P]["output"], undefined>>
-  > {
-    let timeout: any;
-    const timeoutMs = options?.timeout ?? this._config.defaultTimeout ?? 5000;
-    return new Promise<any>((resolve, reject) => {
-      timeout = setTimeout(() => {
-        reject(new Error(`Procedure call timed out after ${timeoutMs}`));
-      }, timeoutMs);
-      const ackId = this._getId();
-      this._ackListeners.set(ackId, { proc: name as string, resolve, reject });
-      this._ws.sendBinary(encodeProcedure(ackId, name as string, input));
+  on<I, O>(proc: Proc<I, O>, handler: ServerProcHandler<I, O, ConnectionData>) {
+    if (this._procs.has(proc.name)) {
+      console.warn(
+        `Procedure '${proc.name}' has already been added and will be overwritten!`
+      );
+    }
+    this._procs.set(proc.name, { proc, handler });
+  }
+
+  /**
+   * Calls a procedure on all clients subscribed to `topics`, ignoring any responses or errors.
+   */
+  async broadcast<I>(
+    topic: string,
+    proc: Proc<I, any>,
+    input: I,
+    options?: BroadcastOptions
+  ) {
+    const parsedInput = await proc.parseInput(input);
+
+    const source = this._connections.values().next().value;
+    if (!source) return;
+
+    const connections = this._topicMap.get(topic);
+    if (connections == null || connections.size === 0) {
+      return;
+    }
+
+    // IDEA: Give server an adapter to broadcast to multiple app instances.
+
+    // Remove excluded connections.
+    if (options?.exclude) {
+      for (const connection of options.exclude) {
+        connections.delete(connection);
+      }
+    }
+
+    const ackId = ""; // empty ackId means broadcast
+    const encoded = encodeProcedure(proc, ackId, parsedInput);
+
+    // Send encoded message to all sockets.
+    for (const connection of connections) {
+      connection._ws.sendBinary(encoded);
+    }
+  }
+
+  /**
+   * Returns the first connection for which `where` returns a truthy value.
+   */
+  find(where: (connection: ServerConnection<ConnectionData>) => any) {
+    for (const conn of this._connections.values()) {
+      if (where(conn)) {
+        return conn;
+      }
+    }
+  }
+
+  /**
+   * Returns all connections for which `where` returns a truthy value.
+   */
+  filter(where: (connection: ServerConnection<ConnectionData>) => any) {
+    const matches: ServerConnection<ConnectionData>[] = [];
+
+    for (const conn of this._connections.values()) {
+      if (where(conn)) {
+        matches.push(conn);
+      }
+    }
+
+    return matches;
+  }
+}
+
+export interface ServerConnectionBroadcastOptions extends BroadcastOptions {
+  includeSelf?: boolean;
+}
+
+/**
+ * Represents one client from the server's perspective.
+ */
+export class ServerConnection<Data> implements Connection {
+  _server: ChatterServer<Data>;
+  _ws: Bun.ServerWebSocket;
+  _topics = new Set<string>();
+  _acks = new Map<string, AckListener>();
+  _ids = new AckIdGenerator();
+
+  data: Data;
+
+  constructor(
+    server: ChatterServer<Data>,
+    ws: Bun.ServerWebSocket,
+    data: Data
+  ) {
+    this._server = server;
+    this._ws = ws;
+    this.data = data;
+  }
+
+  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O> {
+    // Parse input data
+    const parsedInput = await proc.parseInput(input);
+
+    let timer: any;
+    const waitTime = proc.timeout;
+
+    return new Promise<O>(async (resolve, reject) => {
+      // Configure timeout
+      timer = setTimeout(() => {
+        reject(new Error(`Procedure call timed out after ${waitTime}ms`));
+      }, waitTime);
+
+      // Send over _ws, await acknowledgement.
+      const ackId = this._ids.next();
+      this._acks.set(ackId, { proc, resolve, reject });
+      this._ws.sendBinary(encodeProcedure(proc, ackId, parsedInput));
     }).finally(() => {
-      clearTimeout(timeout);
+      clearTimeout(timer);
     });
   }
 
-  subscribe(topic: string) {
-    this._ws.subscribe(topic);
-    this._topics.add(topic);
-  }
-
-  unsubscribe(topic: string) {
-    this._ws.unsubscribe(topic);
-    this._topics.delete(topic);
-  }
-
-  publish<P extends keyof S["client"]>(
+  /**
+   * Calls a procedure on all clients subscribed to `topic`.
+   * Excludes this client unless `options.includeSelf` is true.
+   */
+  broadcast<I>(
     topic: string,
-    name: P,
-    input: S["client"][P]["input"] extends undefined
-      ? undefined
-      : input<Exclude<S["client"][P]["input"], undefined>>,
-  ): void {
-    // empty ackId is a broadcast.
-    const ackId = "";
-
-    // Publish to all subscribed sockets besides this one.
-    this._ws.publishBinary(topic, encodeProcedure(ackId, name as string, input));
+    proc: Proc<I, any>,
+    input: I,
+    options?: ServerConnectionBroadcastOptions
+  ) {
+    return this._server.broadcast(topic, proc, input, {
+      ...options,
+      exclude: options?.includeSelf === true ? undefined : [this],
+    });
   }
-}
 
-export type ServerProcedure<S extends SocketSchema, K extends keyof S["server"]> = (
-  input: S["server"][K]["input"] extends undefined
-    ? void
-    : input<Exclude<S["server"][K]["input"], undefined>>,
-  client: SocketServerClient<S>,
-) =>
-  | Promise<
-      S["server"][K]["output"] extends undefined ? void : input<Exclude<S["server"][K]["output"], undefined>>
-    >
-  | (S["server"][K]["output"] extends undefined ? void : input<Exclude<S["server"][K]["output"], undefined>>);
+  /**
+   * Subscribes this connection to `topic`.
+   */
+  subscribe(topic: string) {
+    this._topics.add(topic);
+    const set = this._server._topicMap.get(topic);
+    if (!set) {
+      this._server._topicMap.set(topic, new Set([this]));
+    } else {
+      set.add(this);
+    }
+  }
 
-export interface SocketServerConfig<S extends SocketSchema> extends SocketConfig<S> {
-  procedures: {
-    [K in keyof S["server"]]: ServerProcedure<S, K>;
-  };
-}
+  /**
+   * Unsubscribes this connection from `topic`.
+   */
+  unsubscribe(topic: string) {
+    this._topics.delete(topic);
+    this._server._topicMap.get(topic)?.delete(this);
+  }
 
-export function createServer<S extends SocketSchema>(config: SocketServerConfig<S>): SocketServer<S> {
-  const clients = new Map<Bun.ServerWebSocket<any>, SocketServerClient<S>>();
-  const events = new Emitter<ServerEvents<S>>();
-
-  const debug = {
-    log(...args: any) {
-      if (config.verbose) {
-        console.log(`[⚡socket]`, ...args);
-      }
-    },
-    warn(...args: any) {
-      if (config.verbose) {
-        console.warn(`[⚡socket]`, ...args);
-      }
-    },
-    error(...args: any) {
-      console.error(`[⚡socket]`, ...args);
-    },
-  };
-
-  return {
-    events,
-
-    publish(topic, name, input) {
-      // Get websocket instance from first client.
-      const client = clients.values().next().value;
-      if (client) {
-        const ws = client._ws;
-        if (ws) {
-          // Publish to all topic subscribers.
-          const ackId = "";
-          const proc = encodeProcedure(ackId, name as string, input);
-
-          ws.publishBinary(topic, proc);
-
-          // Also send to the client, if subscribed.
-          if (ws.isSubscribed(topic)) {
-            ws.sendBinary(proc);
-          }
-
-          // TODO: If we had a reference to the Bun server here could we just server.publish?.
-        }
-      }
-    },
-
-    /**
-     * Returns a list of clients for which `match` returns true.
-     * The match function takes the client's `data` object and returns a boolean.
-     */
-    clientsWhere: (match) => {
-      const matches: SocketServerClient<S>[] = [];
-      let i = 0;
-      for (const [ws, client] of clients) {
-        if (match(client.data, i++)) {
-          matches.push(client);
-        }
-      }
-      return matches;
-    },
-
-    handler: {
-      async open(ws) {
-        const client = new SocketServerClient(ws, config);
-        clients.set(ws, client);
-        events.emit("connect", client);
-        debug.log("client connected");
-      },
-      close(ws, code, reason) {
-        const client = clients.get(ws)!;
-
-        // Reject all still-waiting acks when the connection is closed.
-        for (const listener of client._ackListeners.values()) {
-          listener.reject(new Error(`Client disconnected.`));
-        }
-
-        events.emit("disconnect", client);
-        clients.delete(ws);
-        debug.log("client disconnected", { code, reason });
-      },
-      async message(ws, data) {
-        const client = clients.get(ws);
-        if (client == null) {
-          throw new Error(`No client found for websocket connection`);
-        }
-        if (typeof data === "string") {
-          debug.warn("Expected websocket message to be a Buffer:", data);
-          return;
-        }
-        const message = new Uint8Array(data);
-
-        if (config.verbose) {
-          printMessage(message, (data) => {
-            debug.log("received message", data);
-          });
-        }
-
-        switch (getMessageType(message)) {
-          case MessageType.Procedure: {
-            const proc = decodeProcedure(message);
-            const handler = config.procedures[proc.name];
-            const schema = config.schema.server[proc.name];
-            let input;
-            if (schema.input) {
-              const { success, data, error } = await schema.input.safeParseAsync(proc.input);
-              if (success) {
-                input = data;
-              } else {
-                const e = fromZodError(error).message;
-                debug.error(e);
-                // Acknowledge failure
-                ws.sendBinary(encodeAck(proc.ackId, false, e));
-              }
-            }
-
-            try {
-              const output = await handler(input as any, client);
-              if (schema.output) {
-                const { success, data, error } = schema.output.safeParse(output);
-                if (success) {
-                  ws.sendBinary(encodeAck(proc.ackId, true, data));
-                } else {
-                  debug.warn("bad output", fromZodError(error));
-                  throw new Error(`Bad handler output: ${fromZodError(error).toString()}`);
-                }
-              } else {
-                ws.sendBinary(encodeAck(proc.ackId, true, undefined));
-              }
-            } catch (error) {
-              // Acknowledge failure.
-              ws.sendBinary(encodeAck(proc.ackId, false, error));
-            }
-
-            break;
-          }
-          case MessageType.Ack: {
-            const { ackId, success, output } = decodeAck(message);
-            const listener = client._ackListeners.get(ackId);
-            if (listener) {
-              if (success) {
-                const outputSchema = config.schema.client[listener.proc]?.output;
-                if (outputSchema) {
-                  const { success, data, error } = outputSchema.safeParse(output);
-                  if (success) {
-                    listener.resolve(data);
-                  } else {
-                    listener.reject(error);
-                  }
-                }
-                listener.resolve(undefined);
-              } else {
-                listener.reject(new Error(output));
-              }
-              client._ackListeners.delete(ackId);
-            } else {
-              // TODO: Handle missing listener?
-              debug.warn(`Received unexpected ack for ackId '${ackId}'`);
-            }
-            break;
-          }
-          case MessageType.Ping: {
-            const ackId = decodePing(message);
-            ws.sendBinary(encodeAck(ackId, true, undefined));
-            break;
-          }
-        }
-      },
-      // drain(ws) {},
-    },
-  };
+  isSubscribed(topic: string): boolean {
+    return this._topics.has(topic);
+  }
 }
