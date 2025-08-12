@@ -4,18 +4,6 @@ Chatter is a two-way RPC system built on Bun websockets. Define your remote proc
 
 Type inference and validation is based on [Standard Schema](https://standardschema.dev/), so your schemas can come from any library you prefer.
 
-## Features
-
-- 🌐 **Two-Way RPC**: Procedures can be implemented on the server and called by the client, or vice-versa.
-
-- 🔒 **Bring Your Own Schema Library**: Type-safe by design. Compatible with any validation library that adheres to the Standard Schema interface, like Zod, Valibot, ArkType, and more.
-
-- 📢 **Pub/Sub System**: Built-in support for broadcasting messages to groups of clients using topics.
-
-- 🔌 **Resilient Client**: The client automatically handles reconnects with exponential backoff.
-
-- 🚀 **Efficient**: Uses a fast binary messaging format (CBOR) for low-latency communication.
-
 ---
 
 ## Installation
@@ -36,7 +24,7 @@ npm install @manyducks.co/chatter valibot
 
 ### 1\. Define a Procedure
 
-Create a shared file to define your procedures. By convention, procedures are named in `SCREAMING_SNAKE_CASE`. This example uses **Zod**, but any compatible library will work.
+Create a shared file to define your procedures. By convention, procedures are named in `SCREAMING_SNAKE_CASE`.
 
 ```typescript
 // src/procedures.ts
@@ -44,12 +32,9 @@ import { createProc } from "@manyducks.co/chatter";
 import { z } from "zod";
 
 export const GREET = createProc({
-  // A unique name for the procedure
-  name: "greet",
-  // The schema for the input value
-  takes: z.string(),
-  // The schema for the return value
-  returns: z.string(),
+  name: "greet", // A unique name
+  takes: z.string(), // What you pass to the function when calling it
+  returns: z.string(), // What the function returns
 });
 ```
 

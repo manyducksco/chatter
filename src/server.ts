@@ -62,7 +62,7 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
     this._server = server;
   }
 
-  async open(ws: Bun.ServerWebSocket<undefined>) {
+  open = async (ws: Bun.ServerWebSocket<undefined>) => {
     let connection: ServerConnection<ConnectionData>;
 
     // Init client
@@ -80,13 +80,13 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
     if (opts.onOpen) {
       await opts.onOpen(connection);
     }
-  }
+  };
 
-  async close(
+  close = async (
     ws: Bun.ServerWebSocket<undefined>,
     code: number,
     reason: string
-  ) {
+  ) => {
     // Remove client
     const opts = this._server._options;
     const connection = this._server._connections.get(ws);
@@ -101,20 +101,23 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
     if (opts.onClose) {
       await opts.onClose(connection, code, reason);
     }
-  }
+  };
 
-  async ping(ws: Bun.ServerWebSocket<undefined>, data: Buffer) {
+  ping = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
     // TODO: Mark connection as fresh.
     ws.pong();
-  }
+  };
 
-  async pong(ws: Bun.ServerWebSocket<undefined>, data: Buffer) {
+  pong = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
     // TODO: Mark connection as fresh.
-  }
+  };
 
-  async drain(ws: Bun.ServerWebSocket<undefined>) {}
+  drain = async (ws: Bun.ServerWebSocket<undefined>) => {};
 
-  async message(ws: Bun.ServerWebSocket<undefined>, data: string | Buffer) {
+  message = async (
+    ws: Bun.ServerWebSocket<undefined>,
+    data: string | Buffer
+  ) => {
     const connection = this._server._connections.get(ws);
     if (connection == null) {
       throw new Error(`No connection found for this socket.`);
@@ -135,7 +138,7 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
       case MessageType.Ping:
         return this._handlePing(connection, message);
     }
-  }
+  };
 
   async _handleProcedure(
     connection: ServerConnection<ConnectionData>,
@@ -247,12 +250,24 @@ class ChatterServer<ConnectionData> {
   /**
    * Calls a procedure on all clients subscribed to `topics`, ignoring any responses or errors.
    */
+  async broadcast(
+    topic: string,
+    proc: Proc<null, any>,
+    input?: null,
+    options?: BroadcastOptions
+  ): Promise<void>;
   async broadcast<I>(
     topic: string,
     proc: Proc<I, any>,
     input: I,
     options?: BroadcastOptions
-  ) {
+  ): Promise<void>;
+  async broadcast<I>(
+    topic: string,
+    proc: Proc<I, any>,
+    input?: I,
+    options?: BroadcastOptions
+  ): Promise<void> {
     const parsedInput = await proc.parseInput(input);
 
     const source = this._connections.values().next().value;
@@ -334,7 +349,9 @@ export class ServerConnection<Data> implements Connection {
     this.data = data;
   }
 
-  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O> {
+  async call<O>(proc: Proc<null, O>): Promise<O>;
+  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O>;
+  async call<I, O>(proc: Proc<I, O>, input?: I): Promise<O> {
     // Parse input data
     const parsedInput = await proc.parseInput(input);
 
@@ -360,12 +377,24 @@ export class ServerConnection<Data> implements Connection {
    * Calls a procedure on all clients subscribed to `topic`.
    * Excludes this client unless `options.includeSelf` is true.
    */
+  broadcast(
+    topic: string,
+    proc: Proc<null, any>,
+    input?: null,
+    options?: ServerConnectionBroadcastOptions
+  ): Promise<void>;
   broadcast<I>(
     topic: string,
     proc: Proc<I, any>,
     input: I,
     options?: ServerConnectionBroadcastOptions
-  ) {
+  ): Promise<void>;
+  broadcast<I>(
+    topic: string,
+    proc: Proc<I, any>,
+    input?: I,
+    options?: ServerConnectionBroadcastOptions
+  ): Promise<void> {
     return this._server.broadcast(topic, proc, input, {
       ...options,
       exclude: options?.includeSelf === true ? undefined : [this],

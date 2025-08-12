@@ -116,9 +116,9 @@ class ChatterClient implements Connection {
    * Registers a callback to run when the `state` value changes.
    * Returns a function that stops listening for changes.
    */
-  onStateChange(callback: (state: ConnectionState) => void) {
+  onStateChange(callback: (state: ConnectionState) => void): () => void {
     this.#stateChangeCallbacks.add(callback);
-    return () => this.#stateChangeCallbacks.delete(callback);
+    return () => void this.#stateChangeCallbacks.delete(callback);
   }
 
   /**
@@ -133,7 +133,9 @@ class ChatterClient implements Connection {
     this.#procs.set(proc.name, { proc, handler });
   }
 
-  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O> {
+  async call<O>(proc: Proc<null, O>): Promise<O>;
+  async call<I, O>(proc: Proc<I, O>, input: I): Promise<O>;
+  async call<I, O>(proc: Proc<I, O>, input?: I): Promise<O> {
     const parsedInput = await proc.parseInput(input);
 
     if (this.#socket.readyState !== WebSocket.OPEN) {
