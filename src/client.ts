@@ -6,7 +6,7 @@ import {
   decodeAck,
   decodeProc,
   encodeAck,
-  encodePing,
+  PING_MESSAGE,
   encodeProc,
   getMessageType,
   type Impl,
@@ -321,7 +321,7 @@ class ChatterClient implements Connection {
 
     // Send pings on a timer. If we don't receive a pong message in response within 5 seconds we should reconnect.
     this.#pingTimer = setTimeout(() => {
-      this.#socket.send(encodePing());
+      this.#socket.send(PING_MESSAGE);
       this.#pongTimer = setTimeout(() => {
         this.#socket.close(); // should trigger reconnect
       }, 5 * 1000);

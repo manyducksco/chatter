@@ -279,17 +279,21 @@ export function decodeAck(message: Uint8Array) {
   }
 }
 
-export function encodePing(): Uint8Array {
+function _encodePing(): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeUint8(encoder, MessageType.Ping);
   return encoding.toUint8Array(encoder);
 }
 
-export function encodePong(): Uint8Array {
+function _encodePong(): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeUint8(encoder, MessageType.Pong);
   return encoding.toUint8Array(encoder);
 }
+
+// No need to encode more than once because these will always be the same.
+export const PING_MESSAGE = _encodePing();
+export const PONG_MESSAGE = _encodePong();
 
 /**
  * Prints a human readable representation of a message for debug purposes.

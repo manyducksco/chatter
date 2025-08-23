@@ -5,7 +5,7 @@ import {
   decodeAck,
   decodeProc,
   encodeAck,
-  encodePong,
+  PONG_MESSAGE,
   encodeProc,
   getMessageType,
   type Impl,
@@ -144,7 +144,7 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
   async _handlePing(
     connection: ServerConnection<ConnectionData>
   ): Promise<void> {
-    connection._ws.sendBinary(encodePong());
+    connection._ws.sendBinary(PONG_MESSAGE);
   }
 
   async _handleProc(
