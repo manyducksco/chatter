@@ -1,15 +1,15 @@
 import { v7 } from "uuid";
 import {
   AckIdGenerator,
-  AckListener,
-  Connection,
+  type AckListener,
+  type Connection,
   decodeAck,
-  decodePing,
-  decodeProcedure,
+  decodeProc,
   encodeAck,
-  encodeProcedure,
+  encodePing,
+  encodeProc,
   getMessageType,
-  Impl,
+  type Impl,
   MessageType,
   printMessage,
   Proc,
@@ -34,12 +34,19 @@ export interface ClientConfig {
    * Enables extra logging when true.
    */
   verbose?: boolean;
+
+  /**
+   * Number of seconds to wait after the most recent message was received before sending a ping message.
+   * Pings are used to keep the connection alive and check that we can communicate with the server.
+   * Default is 30 seconds.
+   */
+  pingInterval?: number;
 }
 
 export enum ConnectionState {
-  Offline,
+  Disconnected,
   Connecting,
-  Online,
+  Connected,
 }
 
 const noop = () => undefined;
@@ -72,7 +79,7 @@ class ChatterClient implements Connection {
   #config: ClientConfig;
   #clientId = this.#getClientId();
 
-  #state = ConnectionState.Offline;
+  #state = ConnectionState.Disconnected;
   #stateChangeCallbacks = new Set<(state: ConnectionState) => void>();
 
   #procs = new Map<string, Impl<ClientProcHandler<any, any>>>();
@@ -80,6 +87,9 @@ class ChatterClient implements Connection {
   #socket!: WebSocket;
   #reconnectAttempts = 0;
   #reconnectTimeout: any;
+  #pingTimer: any;
+  #pongTimer: any;
+  #pingInterval = 30;
 
   #ids = new AckIdGenerator();
   #acks = new Map<string, AckListener>();
@@ -89,6 +99,8 @@ class ChatterClient implements Connection {
   constructor(config: ClientConfig) {
     this.#config = config;
     this.#debug = createLogger(config.verbose);
+
+    if (config.pingInterval) this.#pingInterval = config.pingInterval;
 
     document.addEventListener("visibilitychange", this.#onVisibilityChange);
     document.addEventListener("online", this.#onNetworkChange);
@@ -113,6 +125,13 @@ class ChatterClient implements Connection {
   }
 
   /**
+   * True when the socket is open and ready.
+   */
+  get isConnected() {
+    return this.#state === ConnectionState.Connected;
+  }
+
+  /**
    * Registers a callback to run when the `state` value changes.
    * Returns a function that stops listening for changes.
    */
@@ -134,6 +153,7 @@ class ChatterClient implements Connection {
   }
 
   async call<O>(proc: Proc<null, O>): Promise<O>;
+  async call<O>(proc: Proc<null, O>, input: null): Promise<O>;
   async call<I, O>(proc: Proc<I, O>, input: I): Promise<O>;
   async call<I, O>(proc: Proc<I, O>, input?: I): Promise<O> {
     const parsedInput = await proc.parseInput(input);
@@ -177,7 +197,7 @@ class ChatterClient implements Connection {
           reject(error);
         },
       });
-      this.#socket.send(encodeProcedure(proc, ackId, parsedInput));
+      this.#socket.send(encodeProc(proc, ackId, parsedInput));
     }).finally(() => {
       clearTimeout(timer);
     });
@@ -203,7 +223,7 @@ class ChatterClient implements Connection {
     // No-op if already connected.
     if (this.#socket) {
       if (this.#socket.readyState === WebSocket.OPEN) {
-        return this.#setConnectionState(ConnectionState.Online);
+        return this.#setConnectionState(ConnectionState.Connected);
       }
       this.#socket.close();
     }
@@ -223,7 +243,7 @@ class ChatterClient implements Connection {
         callback(state);
       }
 
-      if (this.#state === ConnectionState.Offline) {
+      if (this.#state === ConnectionState.Disconnected) {
         // Reject all pending listeners.
         for (const [id, listener] of Array.from(this.#acks.entries())) {
           listener.reject(new Error(`Socket disconnected.`));
@@ -237,10 +257,10 @@ class ChatterClient implements Connection {
     switch (this.#socket.readyState) {
       case WebSocket.CLOSED:
       case WebSocket.CLOSING:
-        this.#setConnectionState(ConnectionState.Offline);
+        this.#setConnectionState(ConnectionState.Disconnected);
         break;
       case WebSocket.OPEN:
-        this.#setConnectionState(ConnectionState.Online);
+        this.#setConnectionState(ConnectionState.Connected);
         break;
       case WebSocket.CONNECTING:
         this.#setConnectionState(ConnectionState.Connecting);
@@ -292,6 +312,22 @@ class ChatterClient implements Connection {
 
   // ----- Socket Events ----- //
 
+  #clearPing() {
+    clearTimeout(this.#pingTimer);
+  }
+
+  #queuePing() {
+    this.#clearPing();
+
+    // Send pings on a timer. If we don't receive a pong message in response within 5 seconds we should reconnect.
+    this.#pingTimer = setTimeout(() => {
+      this.#socket.send(encodePing());
+      this.#pongTimer = setTimeout(() => {
+        this.#socket.close(); // should trigger reconnect
+      }, 5 * 1000);
+    }, this.#pingInterval * 1000);
+  }
+
   #onOpen = (event: Event) => {
     this.#debug.log("Socket connected.");
 
@@ -299,7 +335,7 @@ class ChatterClient implements Connection {
     window.addEventListener("beforeunload", this.#beforeUnload);
     this.#reconnectAttempts = 0;
 
-    // TODO: Ping
+    this.#queuePing();
   };
 
   #onClose = (event: CloseEvent) => {
@@ -307,9 +343,7 @@ class ChatterClient implements Connection {
 
     this.#updateConnectionState();
     window.removeEventListener("beforeunload", this.#beforeUnload);
-
-    // TODO: Cancel ping
-
+    this.#clearPing();
     this.#tryReconnect();
   };
 
@@ -320,9 +354,7 @@ class ChatterClient implements Connection {
 
     this.#updateConnectionState();
     window.removeEventListener("beforeunload", this.#beforeUnload);
-
-    // TODO: Cancel ping
-
+    this.#clearPing();
     this.#tryReconnect();
   };
 
@@ -336,9 +368,8 @@ class ChatterClient implements Connection {
     }
     const message = new Uint8Array(event.data);
 
-    // Push back ping when we receive a message; we know the connection is alive.
-    // ping.queue();
     this.#updateConnectionState();
+    this.#queuePing();
 
     if (this.#config.verbose) {
       printMessage(message, (data) => {
@@ -347,17 +378,22 @@ class ChatterClient implements Connection {
     }
 
     switch (getMessageType(message)) {
-      case MessageType.Procedure:
-        return this.#handleProcedure(message);
+      case MessageType.Pong:
+        return this.#handlePong();
+      case MessageType.Proc:
+        return this.#handleProc(message);
       case MessageType.Ack:
         return this.#handleAck(message);
-      case MessageType.Ping:
-        return this.#handlePing(message);
     }
   };
 
-  async #handleProcedure(message: Uint8Array) {
-    const decoded = decodeProcedure(message);
+  async #handlePong() {
+    // Prevent connection close if pong was received before the timer completed.
+    clearTimeout(this.#pongTimer);
+  }
+
+  async #handleProc(message: Uint8Array) {
+    const decoded = decodeProc(message);
     const impl = this.#procs.get(decoded.name);
     if (!impl) {
       // Respond with an error.
@@ -431,10 +467,5 @@ class ChatterClient implements Connection {
         listener.reject(new Error(decoded.output));
       }
     }
-  }
-
-  #handlePing(message: Uint8Array) {
-    const ackId = decodePing(message);
-    this.#socket.send(encodeAck(ackId, true, null));
   }
 }

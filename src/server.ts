@@ -1,15 +1,15 @@
 import {
   AckIdGenerator,
-  AckListener,
-  Connection,
+  type AckListener,
+  type Connection,
   decodeAck,
-  decodePing,
-  decodeProcedure,
+  decodeProc,
   encodeAck,
-  encodeProcedure,
+  encodePong,
+  encodeProc,
   getMessageType,
-  Impl,
-  MaybePromise,
+  type Impl,
+  type MaybePromise,
   MessageType,
   Proc,
 } from "./core";
@@ -38,7 +38,7 @@ export interface ServerOptions<Data> {
   /**
    * Called just after the client connects. The return value is set as the `data` field on the connection object.
    */
-  onInit?: (info: ConnectionInfo) => Promise<Data>;
+  getConnectionData?: (info: ConnectionInfo) => Promise<Data>;
 
   /**
    * Called just after the connection is initialized, but before it starts receiving events.
@@ -67,8 +67,8 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
 
     // Init client
     const opts = this._server._options;
-    if (opts.onInit) {
-      const data = await opts.onInit({ ws });
+    if (opts.getConnectionData) {
+      const data = await opts.getConnectionData({ ws });
       connection = new ServerConnection(this._server, ws, data);
     } else {
       connection = new ServerConnection(this._server, ws, {} as ConnectionData);
@@ -103,14 +103,15 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
     }
   };
 
-  ping = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
-    // TODO: Mark connection as fresh.
-    ws.pong();
-  };
+  // ping = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
+  //   const connection = this._server._connections.get(ws);
+  //   console.log("ping received", connection);
+  // };
 
-  pong = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
-    // TODO: Mark connection as fresh.
-  };
+  // pong = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
+  //   const connection = this._server._connections.get(ws);
+  //   console.log("pong received", connection);
+  // };
 
   drain = async (ws: Bun.ServerWebSocket<undefined>) => {};
 
@@ -131,21 +132,27 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
 
     // Process incoming message
     switch (getMessageType(message)) {
-      case MessageType.Procedure:
-        return this._handleProcedure(connection, message);
+      case MessageType.Ping:
+        return this._handlePing(connection);
+      case MessageType.Proc:
+        return this._handleProc(connection, message);
       case MessageType.Ack:
         return this._handleAck(connection, message);
-      case MessageType.Ping:
-        return this._handlePing(connection, message);
     }
   };
 
-  async _handleProcedure(
+  async _handlePing(
+    connection: ServerConnection<ConnectionData>
+  ): Promise<void> {
+    connection._ws.sendBinary(encodePong());
+  }
+
+  async _handleProc(
     connection: ServerConnection<ConnectionData>,
     message: Uint8Array
   ): Promise<void> {
     const ws = connection._ws;
-    const decoded = decodeProcedure(message);
+    const decoded = decodeProc(message);
     const impl = this._server._procs.get(decoded.name);
     if (!impl) {
       // Respond with an error.
@@ -199,14 +206,6 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
       }
     }
   }
-
-  async _handlePing(
-    connection: ServerConnection<ConnectionData>,
-    message: Uint8Array
-  ): Promise<void> {
-    const ackId = decodePing(message);
-    connection._ws.sendBinary(encodeAck(ackId, true, null));
-  }
 }
 
 export function createServer<ConnectionData>(
@@ -248,7 +247,7 @@ class ChatterServer<ConnectionData> {
   }
 
   /**
-   * Calls a procedure on all clients subscribed to `topics`, ignoring any responses or errors.
+   * Calls a procedure on all clients subscribed to `topic`.
    */
   async broadcast(
     topic: string,
@@ -262,8 +261,25 @@ class ChatterServer<ConnectionData> {
     input: I,
     options?: BroadcastOptions
   ): Promise<void>;
+
+  /**
+   * Calls a procedure on all clients subscribed to any topic in `topics`.
+   */
+  async broadcast(
+    topics: Iterable<string>,
+    proc: Proc<null, any>,
+    input?: null,
+    options?: BroadcastOptions
+  ): Promise<void>;
   async broadcast<I>(
-    topic: string,
+    topics: Iterable<string>,
+    proc: Proc<I, any>,
+    input: I,
+    options?: BroadcastOptions
+  ): Promise<void>;
+
+  async broadcast<I>(
+    topic: string | Iterable<string>,
     proc: Proc<I, any>,
     input?: I,
     options?: BroadcastOptions
@@ -273,8 +289,20 @@ class ChatterServer<ConnectionData> {
     const source = this._connections.values().next().value;
     if (!source) return;
 
-    const connections = this._topicMap.get(topic);
-    if (connections == null || connections.size === 0) {
+    // Collect all connections subscribed to any of the given topics.
+    const connections = new Set<ServerConnection<ConnectionData>>();
+    const topics = new Set<string>(typeof topic === "string" ? [topic] : topic);
+
+    for (const t of topics) {
+      const set = this._topicMap.get(t);
+      if (set) {
+        for (const connection of set) {
+          connections.add(connection);
+        }
+      }
+    }
+
+    if (connections.size === 0) {
       return;
     }
 
@@ -288,7 +316,7 @@ class ChatterServer<ConnectionData> {
     }
 
     const ackId = ""; // empty ackId means broadcast
-    const encoded = encodeProcedure(proc, ackId, parsedInput);
+    const encoded = encodeProc(proc, ackId, parsedInput);
 
     // Send encoded message to all sockets.
     for (const connection of connections) {
@@ -336,6 +364,9 @@ export class ServerConnection<Data> implements Connection {
   _topics = new Set<string>();
   _acks = new Map<string, AckListener>();
   _ids = new AckIdGenerator();
+  _pingTimer: any;
+  _staleTimer: any;
+  _pingInterval = 30;
 
   data: Data;
 
@@ -349,6 +380,9 @@ export class ServerConnection<Data> implements Connection {
     this.data = data;
   }
 
+  /**
+   * Calls a procedure on the client and returns its response.
+   */
   async call<O>(proc: Proc<null, O>): Promise<O>;
   async call<I, O>(proc: Proc<I, O>, input: I): Promise<O>;
   async call<I, O>(proc: Proc<I, O>, input?: I): Promise<O> {
@@ -367,7 +401,7 @@ export class ServerConnection<Data> implements Connection {
       // Send over _ws, await acknowledgement.
       const ackId = this._ids.next();
       this._acks.set(ackId, { proc, resolve, reject });
-      this._ws.sendBinary(encodeProcedure(proc, ackId, parsedInput));
+      this._ws.sendBinary(encodeProc(proc, ackId, parsedInput));
     }).finally(() => {
       clearTimeout(timer);
     });
@@ -389,8 +423,26 @@ export class ServerConnection<Data> implements Connection {
     input: I,
     options?: ServerConnectionBroadcastOptions
   ): Promise<void>;
+
+  /**
+   * Calls a procedure on all clients subscribed to any topic in `topics`.
+   * Excludes this client unless `options.includeSelf` is true.
+   */
+  broadcast(
+    topics: Iterable<string>,
+    proc: Proc<null, any>,
+    input?: null,
+    options?: ServerConnectionBroadcastOptions
+  ): Promise<void>;
   broadcast<I>(
-    topic: string,
+    topics: Iterable<string>,
+    proc: Proc<I, any>,
+    input: I,
+    options?: ServerConnectionBroadcastOptions
+  ): Promise<void>;
+
+  broadcast<I>(
+    topic: string | Iterable<string>,
     proc: Proc<I, any>,
     input?: I,
     options?: ServerConnectionBroadcastOptions
@@ -424,5 +476,9 @@ export class ServerConnection<Data> implements Connection {
 
   isSubscribed(topic: string): boolean {
     return this._topics.has(topic);
+  }
+
+  _destroy() {
+    clearTimeout(this._pingTimer);
   }
 }

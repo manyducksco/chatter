@@ -71,6 +71,10 @@ export type ProcOutput<T extends ProcSchema<any, any>> =
 
 export type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * Defines a proc with a name, schema and default options.
+ * Can be implemented by the client or server.
+ */
 export function createProc<Config extends ProcConfig<any, any>>(
   config: Config
 ): Proc<ProcInput<Config>, ProcOutput<Config>> {
@@ -128,8 +132,9 @@ export interface Connection {
 
 export enum MessageType {
   Ping = 0,
-  Procedure = 1,
-  Ack = 2,
+  Pong = 1,
+  Proc = 2,
+  Ack = 3,
 }
 
 export enum MessageDataType {
@@ -157,25 +162,25 @@ function _encodeData(encoder: encoding.Encoder, data: unknown) {
   }
 }
 
-export function encodeProcedure<I>(
+export function encodeProc<I>(
   proc: Proc<I, any>,
   ackId: string,
   input: I
 ): Uint8Array {
   const encoder = encoding.createEncoder();
-  encoding.writeUint8(encoder, MessageType.Procedure);
+  encoding.writeUint8(encoder, MessageType.Proc);
   encoding.writeVarString(encoder, ackId);
   encoding.writeVarString(encoder, proc.name);
   _encodeData(encoder, input);
   return encoding.toUint8Array(encoder);
 }
 
-export function decodeProcedure(message: Uint8Array) {
+export function decodeProc(message: Uint8Array) {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
-  if (type !== MessageType.Procedure) {
+  if (type !== MessageType.Proc) {
     throw new TypeError(
-      `Message cannot be decoded as a procedure call. Expected type ${MessageType.Procedure} but got ${type}`
+      `Message cannot be decoded as a procedure call. Expected type ${MessageType.Proc} but got ${type}`
     );
   }
   const ackId = decoding.readVarString(decoder);
@@ -274,25 +279,16 @@ export function decodeAck(message: Uint8Array) {
   }
 }
 
-export function encodePing(ackId: string): Uint8Array {
+export function encodePing(): Uint8Array {
   const encoder = encoding.createEncoder();
   encoding.writeUint8(encoder, MessageType.Ping);
-  encoding.writeVarString(encoder, ackId);
   return encoding.toUint8Array(encoder);
 }
 
-/**
- * Decodes a ping message, returning the ackId.
- */
-export function decodePing(message: Uint8Array): string {
-  const decoder = decoding.createDecoder(message);
-  const type = decoding.readUint8(decoder);
-  if (type !== MessageType.Ping) {
-    throw new TypeError(
-      `Message is not a ping. Expected type ${MessageType.Ping}, but got ${type}`
-    );
-  }
-  return decoding.readVarString(decoder);
+export function encodePong(): Uint8Array {
+  const encoder = encoding.createEncoder();
+  encoding.writeUint8(encoder, MessageType.Pong);
+  return encoding.toUint8Array(encoder);
 }
 
 /**
@@ -319,10 +315,10 @@ export function printMessage(
         },
       };
       break;
-    case MessageType.Procedure:
+    case MessageType.Proc:
       data = {
         type: "procedure",
-        payload: decodeProcedure(message),
+        payload: decodeProc(message),
       };
       break;
     case MessageType.Ack:

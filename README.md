@@ -14,7 +14,7 @@ First, install Chatter and your schema library of choice.
 # With Zod (recommended)
 npm install @manyducks.co/chatter zod
 
-# Or with Valibot
+# Or with Valibot, for example
 npm install @manyducks.co/chatter valibot
 ```
 
@@ -22,7 +22,9 @@ npm install @manyducks.co/chatter valibot
 
 ## Quick Start
 
-### 1\. Define a Procedure
+Here's an example. We'll define a single procedure and implement it on both client and server. Both implementations will simply take the message it received, wait one second, and send it back. The client and server will continue doing this in an infinite loop.
+
+### 1\. Define a procedure
 
 Create a shared file to define your procedures. By convention, procedures are named in `SCREAMING_SNAKE_CASE`.
 
@@ -31,38 +33,47 @@ Create a shared file to define your procedures. By convention, procedures are na
 import { createProc } from "@manyducks.co/chatter";
 import { z } from "zod";
 
-export const GREET = createProc({
-  name: "greet", // A unique name
-  takes: z.string(), // What you pass to the function when calling it
-  returns: z.string(), // What the function returns
+export const REPEAT = createProc({
+  name: "repeat", // A unique name
+
+  // What you pass to the function when calling it
+  takes: z.object({ message: z.string(), forwards: z.number() }),
+
+  // What the function returns
+  returns: z.string(),
 });
 ```
 
-### 2\. Implement on the Server
+### 2\. Set up the server
 
 Create a Bun server and implement the `GREET` procedure.
 
 ```typescript
 // src/server.ts
 import { createServer } from "@manyducks.co/chatter";
-import { GREET } from "./procedures";
+import { REPEAT } from "./procedures";
 
 const chatter = createServer();
 
-// Implement the GREET procedure
-chatter.on(GREET, async (name) => {
-  console.log(`Received greeting for: ${name}`);
-  return `Hello ${name}. This message is from the server!`;
+// Implement the server's version:
+chatter.on(REPEAT, (data, connection) => {
+  console.log(`REPEAT #${data.forwards}: ${data.message}`);
+
+  setTimeout(() => {
+    connection.call(REPEAT, {
+      message: data.message,
+      forwards: data.forwards + 1,
+    });
+  }, 1000);
 });
 
 // Start the Bun server
 Bun.serve({
   port: 3000,
   fetch(req, server) {
-    if (server.upgrade(req)) {
-      return; // Bun handles the response
+    if (!server.upgrade(req)) {
+      return new Response("Upgrade failed :(", { status: 500 });
     }
-    return new Response("Upgrade failed :(", { status: 500 });
   },
   // Chatter handles the websockets
   websocket: chatter.websocket,
@@ -77,19 +88,29 @@ Finally, create a client that connects to the server and calls the procedure.
 
 ```typescript
 // src/client.ts
-import { createClient, ConnectionState } from "@manyducks.co/chatter";
+import { createClient } from "@manyducks.co/chatter";
 import { GREET } from "./procedures";
 
 const client = createClient({
   url: "ws://localhost:3000",
 });
 
-client.onStateChange(async (state) => {
-  if (state === ConnectionState.Online) {
+// Implement the client's version:
+chatter.on(REPEAT, (data, connection) => {
+  console.log(`REPEAT #${data.forwards}: ${data.message}`);
+
+  setTimeout(() => {
+    connection.call(REPEAT, {
+      message: data.message,
+      forwards: data.forwards + 1,
+    });
+  }, 1000);
+});
+
+client.onStateChange(async () => {
+  if (client.isConnected) {
     // Once connected, call the server's procedure
-    const response = await client.call(GREET, "World");
-    console.log("Server responded:", response);
-    // -> Server responded: Hello World. This message is from the server!
+    client.call(GREET, { message: "", forwards: 0 });
   }
 });
 ```
