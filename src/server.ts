@@ -205,6 +205,8 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
         listener.reject(new Error(decoded.output));
       }
     }
+
+    connection._acks.delete(decoded.ackId);
   }
 }
 
@@ -393,14 +395,24 @@ export class ServerConnection<Data> implements Connection {
     const waitTime = proc.timeout;
 
     return new Promise<O>(async (resolve, reject) => {
+      const ackId = this._ids.next();
+      const listener: AckListener = {
+        proc,
+        timestamp: Date.now(),
+        resolve,
+        reject,
+      };
+      this._acks.set(ackId, listener);
+
       // Configure timeout
       timer = setTimeout(() => {
-        reject(new Error(`Procedure call timed out after ${waitTime}ms`));
+        listener.reject(
+          new Error(`Procedure call timed out after ${waitTime}ms`)
+        );
+        this._acks.delete(ackId);
       }, waitTime);
 
       // Send over _ws, await acknowledgement.
-      const ackId = this._ids.next();
-      this._acks.set(ackId, { proc, resolve, reject });
       this._ws.sendBinary(encodeProc(proc, ackId, parsedInput));
     }).finally(() => {
       clearTimeout(timer);

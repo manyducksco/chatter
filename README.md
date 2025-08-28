@@ -22,9 +22,9 @@ bun install valibot
 ...
 ```
 
-## Simple Echo App Example
+## Live Counter Example
 
-This example shows how to set up the `REPEAT` procedure on both the client and server. Both sides will take a message, wait one second, and send it back in an endless loop.
+This example shows how to set up a realtime counter. Clients can connect to the server and alter the counter's value. All connected users will see the number change in real time.
 
 ### 1. Define a Procedure
 
@@ -35,38 +35,47 @@ Create a shared file to define your procedures. By convention, procedures are na
 import { createProc } from "@manyducks.co/chatter";
 import { z } from "zod";
 
-export const REPEAT = createProc({
-  name: "repeat", // A unique name
+export const GET_COUNT = createProc({
+  name: "get_count",
+  returns: z.number(), // what the function returns
+  // this proc doesn't take anything, so there is no 'takes' schema.
+});
 
-  // What you pass to the function when calling it
-  takes: z.object({ message: z.string(), forwards: z.number() }),
-
-  // What the function returns
-  returns: z.string(),
+export const UPDATE_COUNT = createProc({
+  name: "update_count",
+  takes: z.number(), // what you pass to the function when calling it
+  // this proc doesn't return anything, so there is no 'returns' schema.
 });
 ```
 
 ### 2. Set up the Server
 
-Create a Bun server and implement the `REPEAT` procedure.
+Create a Bun server and implement the three procedures.
 
 ```ts
 // src/server.ts
 import { createServer } from "@manyducks.co/chatter";
-import { REPEAT } from "./procedures";
+import { GET_VALUE, INCREMENT, DECREMENT } from "./procedures";
 
 const chatter = createServer();
 
-// Implement the server's version:
-chatter.on(REPEAT, (data, connection) => {
-  console.log(`REPEAT #${data.forwards}: ${data.message}`);
+// We'll store the current value in memory on the server.
+let currentValue = 0;
 
-  setTimeout(() => {
-    connection.call(REPEAT, {
-      message: data.message,
-      forwards: data.forwards + 1,
-    });
-  }, 1000);
+// GET_COUNT simply returns the current value to the caller.
+// The first argument is the `takes` value, which is _ since we aren't taking anything.
+// The second argument is a connection to the client who called this procedure.
+chatter.on(GET_COUNT, (_, connection) => {
+  return currentValue;
+});
+
+chatter.on(UPDATE_COUNT, (amount, connection) => {
+  // Update the stored value.
+  currentValue += amount;
+
+  // Broadcast the same event to every other connected client to keep them in sync.
+  // Client and server both implement the same procedure.
+  connection.broadcast(UPDATE_COUNT, amount);
 });
 
 // Start the Bun server
@@ -91,30 +100,37 @@ Finally, create a client that connects to the server and calls the procedure.
 ```ts
 // src/client.ts
 import { createClient } from "@manyducks.co/chatter";
-import { REPEAT } from "./procedures";
+import { GET_COUNT, UPDATE_COUNT } from "./procedures";
 
-const client = createClient({
+const chatter = createClient({
   url: "ws://localhost:3000",
 });
 
-// Implement the client's version:
-client.on(REPEAT, (data, connection) => {
-  console.log(`REPEAT #${data.forwards}: ${data.message}`);
+let currentValue = 0;
 
-  setTimeout(() => {
-    connection.call(REPEAT, {
-      message: data.message,
-      forwards: data.forwards + 1,
-    });
-  }, 1000);
+// The client implements UPDATE_COUNT so the server can broadcast changes by other users.
+chatter.on(UPDATE_COUNT, (amount, connection) => {
+  currentValue += amount;
 });
 
-client.onStateChange(async () => {
-  if (client.isConnected) {
-    // Once connected, call the server's procedure
-    client.call(REPEAT, { message: "HELLO", forwards: 0 });
+// Load current value from server as soon as we connect.
+chatter.onStateChange(async () => {
+  if (chatter.isConnected) {
+    currentValue = await chatter.call(GET_COUNT);
   }
 });
+
+// Implement some methods the UI will use to change the value.
+// We simultaneously update our local state and let the server know so it can update other clients.
+async function increment(amount = 1) {
+  currentValue += amount;
+  await chatter.call(UPDATE_COUNT, amount);
+}
+
+async function decrement(amount = 1) {
+  currentValue -= amount;
+  await chatter.call(UPDATE_COUNT, -amount);
+}
 ```
 
 ## API
@@ -190,7 +206,11 @@ The current connection state. This is an enum called `ConnectionState`. Possible
 
 #### `client.clientId`
 
-A persistent, unique ID for the client, stored in local storage.
+A persistent, unique UUID for the client, stored in local storage.
+
+#### `client.sessionId`
+
+An ephemeral UUID to identify this particular session. Stored in memory and regenerated if the page is reloaded.
 
 ### Methods
 

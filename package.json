@@ -1,7 +1,7 @@
 {
   "name": "@manyducks.co/chatter",
   "description": "Two-way websocket RPC for Bun",
-  "version": "2.0.0-rc.3",
+  "version": "2.0.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

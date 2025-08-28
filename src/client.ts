@@ -78,6 +78,7 @@ export function createClient(config: ClientConfig): ChatterClient {
 class ChatterClient implements Connection {
   #config: ClientConfig;
   #clientId = this.#getClientId();
+  #sessionId = v7();
 
   #state = ConnectionState.Disconnected;
   #stateChangeCallbacks = new Set<(state: ConnectionState) => void>();
@@ -118,10 +119,17 @@ class ChatterClient implements Connection {
   }
 
   /**
-   * Persistent client ID.
+   * Persistent client ID. Stored in localStorage to persist between sessions.
    */
   get clientId() {
     return this.#clientId;
+  }
+
+  /**
+   * Ephemeral session ID. Regenerated each time the page is loaded.
+   */
+  get sessionId() {
+    return this.#sessionId;
   }
 
   /**
@@ -166,23 +174,17 @@ class ChatterClient implements Connection {
     const waitTime = proc.timeout;
 
     return new Promise<O>((resolve, reject) => {
-      // Configure timeout
-      timer = setTimeout(() => {
-        reject(new Error(`Procedure call timed out after ${waitTime}ms.`));
-      }, waitTime);
-
-      // Send over socket, await acknowledgement
-      const startTime = Date.now();
       const ackId = this.#ids.next();
-      this.#acks.set(ackId, {
+      const listener: AckListener = {
         proc,
+        timestamp: Date.now(),
         resolve: (output) => {
           this.#debug.log("call succeeded", {
             ackId,
             name: proc.name,
             input: parsedInput,
             output,
-            elapsed: Date.now() - startTime,
+            elapsed: Date.now() - listener.timestamp,
           });
           resolve(output);
         },
@@ -192,11 +194,21 @@ class ChatterClient implements Connection {
             name: proc.name,
             input: parsedInput,
             error,
-            elapsed: Date.now() - startTime,
+            elapsed: Date.now() - listener.timestamp,
           });
           reject(error);
         },
-      });
+      };
+      this.#acks.set(ackId, listener);
+
+      // Configure timeout
+      timer = setTimeout(() => {
+        listener.reject(
+          new Error(`Procedure call timed out after ${waitTime}ms.`)
+        );
+        this.#acks.delete(ackId);
+      }, waitTime);
+
       this.#socket.send(encodeProc(proc, ackId, parsedInput));
     }).finally(() => {
       clearTimeout(timer);
@@ -246,7 +258,11 @@ class ChatterClient implements Connection {
       if (this.#state === ConnectionState.Disconnected) {
         // Reject all pending listeners.
         for (const [id, listener] of Array.from(this.#acks.entries())) {
-          listener.reject(new Error(`Socket disconnected.`));
+          listener.reject(
+            new Error(
+              `Ack rejected: socket disconnected. (ackId: ${id}, proc: ${listener.proc.name})`
+            )
+          );
           this.#acks.delete(id);
         }
       }
@@ -331,8 +347,9 @@ class ChatterClient implements Connection {
   #onOpen = (event: Event) => {
     this.#debug.log("Socket connected.");
 
-    this.#updateConnectionState();
     window.addEventListener("beforeunload", this.#beforeUnload);
+
+    this.#updateConnectionState();
     this.#reconnectAttempts = 0;
 
     this.#queuePing();
@@ -341,8 +358,9 @@ class ChatterClient implements Connection {
   #onClose = (event: CloseEvent) => {
     this.#debug.warn("Socket closed.");
 
-    this.#updateConnectionState();
     window.removeEventListener("beforeunload", this.#beforeUnload);
+
+    this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -352,8 +370,9 @@ class ChatterClient implements Connection {
 
     this.#debug.error("Socket error", event);
 
-    this.#updateConnectionState();
     window.removeEventListener("beforeunload", this.#beforeUnload);
+
+    this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -467,5 +486,7 @@ class ChatterClient implements Connection {
         listener.reject(new Error(decoded.output));
       }
     }
+
+    this.#acks.delete(decoded.ackId);
   }
 }

@@ -21,6 +21,7 @@ export class AckIdGenerator {
 
 export interface AckListener<O = any> {
   proc: Proc<any, O>;
+  timestamp: number;
   resolve(output: O): void;
   reject(error: Error): void;
 }
