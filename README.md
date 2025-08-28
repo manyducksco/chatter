@@ -50,7 +50,7 @@ export const UPDATE_COUNT = createProc({
 
 ### 2. Set up the Server
 
-Create a Bun server and implement the three procedures.
+Create a Bun server and implement both procedures.
 
 ```ts
 // src/server.ts
@@ -96,7 +96,7 @@ console.log("Chatter server listening on port 3000");
 
 ### 3. Call from the Client
 
-Finally, create a client that connects to the server and calls the procedure.
+Finally, create a client that connects to the server and calls and responds to procedures.
 
 ```ts
 // src/client.ts
