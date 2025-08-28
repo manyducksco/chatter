@@ -484,4 +484,4 @@ if (connection.isSubscribed("chat-room-1")) {
 
 ---
 
-[That's a lot of ducks.](https://www.manyducks.co)
+[🦆 That's a lot of ducks.](https://www.manyducks.co)
