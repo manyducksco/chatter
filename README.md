@@ -43,8 +43,8 @@ export const GET_COUNT = createProc({
 
 export const UPDATE_COUNT = createProc({
   name: "update_count",
-  takes: z.number(), // what you pass to the function when calling it
-  // this proc doesn't return anything, so there is no 'returns' schema.
+  takes: z.number(),
+  returns: z.number(),
 });
 ```
 
@@ -55,17 +55,15 @@ Create a Bun server and implement the three procedures.
 ```ts
 // src/server.ts
 import { createServer } from "@manyducks.co/chatter";
-import { GET_VALUE, INCREMENT, DECREMENT } from "./procedures";
+import { GET_COUNT, UPDATE_COUNT } from "./procedures";
 
 const chatter = createServer();
 
 // We'll store the current value in memory on the server.
 let currentValue = 0;
 
-// GET_COUNT simply returns the current value to the caller.
-// The first argument is the `takes` value, which is _ since we aren't taking anything.
-// The second argument is a connection to the client who called this procedure.
-chatter.on(GET_COUNT, (_, connection) => {
+chatter.on(GET_COUNT, () => {
+  // Simply returns the current count to the caller.
   return currentValue;
 });
 
@@ -73,9 +71,12 @@ chatter.on(UPDATE_COUNT, (amount, connection) => {
   // Update the stored value.
   currentValue += amount;
 
-  // Broadcast the same event to every other connected client to keep them in sync.
-  // Client and server both implement the same procedure.
+  // Broadcast the same event to every other connected client.
+  // Connection is the client who called this proc, so broadcast() will exclude them by default.
   connection.broadcast(UPDATE_COUNT, amount);
+
+  // And return the new value back to the caller.
+  return currentValue;
 });
 
 // Start the Bun server
@@ -109,27 +110,25 @@ const chatter = createClient({
 let currentValue = 0;
 
 // The client implements UPDATE_COUNT so the server can broadcast changes by other users.
-chatter.on(UPDATE_COUNT, (amount, connection) => {
+chatter.on(UPDATE_COUNT, (amount) => {
   currentValue += amount;
 });
 
-// Load current value from server as soon as we connect.
 chatter.onStateChange(async () => {
+  // Load current value from server as soon as we connect.
   if (chatter.isConnected) {
     currentValue = await chatter.call(GET_COUNT);
   }
 });
 
-// Implement some methods the UI will use to change the value.
-// We simultaneously update our local state and let the server know so it can update other clients.
+// Implement some methods the UI can use to change the value.
 async function increment(amount = 1) {
-  currentValue += amount;
-  await chatter.call(UPDATE_COUNT, amount);
+  // Tell the server to update its stqte and set our local state to the resulting value.
+  currentValue = await chatter.call(UPDATE_COUNT, amount);
 }
 
 async function decrement(amount = 1) {
-  currentValue -= amount;
-  await chatter.call(UPDATE_COUNT, -amount);
+  currentValue = await chatter.call(UPDATE_COUNT, -amount);
 }
 ```
 
