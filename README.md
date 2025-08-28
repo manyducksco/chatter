@@ -123,7 +123,7 @@ chatter.onStateChange(async () => {
 
 // Implement some methods the UI can use to change the value.
 async function increment(amount = 1) {
-  // Tell the server to update its stqte and set our local state to the resulting value.
+  // Tell the server to update and then set our local state to the resulting value.
   currentValue = await chatter.call(UPDATE_COUNT, amount);
 }
 
