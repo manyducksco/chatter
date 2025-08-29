@@ -57,7 +57,13 @@ Create a Bun server and implement both procedures.
 import { createServer } from "@manyducks.co/chatter";
 import { GET_COUNT, UPDATE_COUNT } from "./procedures";
 
-const chatter = createServer();
+const chatter = createServer({
+  onOpen: (connection) => {
+    // Subscribe all new connections to the counter topic.
+    // This allows them to receive broadcasts directed to this topic.
+    connection.subscribe("counter");
+  },
+});
 
 // We'll store the current value in memory on the server.
 let currentValue = 0;
@@ -71,9 +77,9 @@ chatter.on(UPDATE_COUNT, (amount, connection) => {
   // Update the stored value.
   currentValue += amount;
 
-  // Broadcast the same event to every other connected client.
+  // Broadcast the same event to every connection subscribed to the `counter` topic.
   // Connection is the client who called this proc, so broadcast() will exclude them by default.
-  connection.broadcast(UPDATE_COUNT, amount);
+  connection.broadcast("counter", UPDATE_COUNT, amount);
 
   // And return the new value back to the caller.
   return currentValue;
