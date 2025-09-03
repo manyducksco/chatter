@@ -125,17 +125,7 @@ class ChatterClient implements Connection {
 
   #debug: Logger;
 
-  #pingTimings: number[] = [];
   #lastPingSentAt?: number;
-
-  get pingLatency() {
-    return {
-      latest: this.#pingTimings.at(-1),
-      average:
-        this.#pingTimings.reduce((sum, ping) => sum + ping, 0) /
-        this.#pingTimings.length,
-    };
-  }
 
   constructor(config: ClientConfig) {
     this.#config = config;
@@ -248,8 +238,6 @@ class ChatterClient implements Connection {
       const message = encodeProc(proc, ackId, parsedInput);
 
       if (this.#socket.readyState !== WebSocket.OPEN || !this.isConnected) {
-        // TODO: Store in offlineCallQueue
-
         this.#debug.warn(
           `Socket is offline; queuing call to send when connection is ready.`
         );
@@ -380,8 +368,8 @@ class ChatterClient implements Connection {
 
     // Send pings on a timer. If we don't receive a pong message in response within 5 seconds we should reconnect.
     this.#pingTimer = setTimeout(() => {
-      this.#socket.send(PING_MESSAGE);
       this.#lastPingSentAt = performance.now();
+      this.#socket.send(PING_MESSAGE);
       this.#pongTimer = setTimeout(() => {
         this.#socket.close(); // should trigger reconnect
       }, 5 * 1000);
@@ -394,8 +382,8 @@ class ChatterClient implements Connection {
    */
   #pingCheck() {
     this.#clearPing();
-    this.#socket.send(PING_MESSAGE);
     this.#lastPingSentAt = performance.now();
+    this.#socket.send(PING_MESSAGE);
     this.#pongTimer = setTimeout(() => {
       this.#socket.close(); // should trigger reconnect
     }, 2 * 1000); // wait only 2 seconds
@@ -490,8 +478,8 @@ class ChatterClient implements Connection {
     // Prevent connection close when pong is received before the timer completes.
     clearTimeout(this.#pongTimer);
 
-    const timing = performance.now() - this.#lastPingSentAt!;
-    this.#pingTimings.push(timing);
+    const timing =
+      performance.now() - (this.#lastPingSentAt ?? performance.now());
     this.#debug.log(`received pong in ${timing}ms`);
   }
 
