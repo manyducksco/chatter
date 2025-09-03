@@ -14,6 +14,7 @@ import {
   MessageType,
   PONG_MESSAGE,
   Proc,
+  encodeBroadcast,
 } from "./core";
 
 /**
@@ -80,8 +81,6 @@ class ServerSocketHandler<ConnectionData>
     if (current) {
       // Point current connection to new socket.
       await current._reconnect(ws);
-      console.log("Reconnected session", sessionId);
-
       ws.sendBinary(READY_MESSAGE);
     } else {
       // Otherwise init new.
@@ -386,10 +385,9 @@ class ChatterServer<ConnectionData> {
       }
     }
 
-    const ackId = ""; // empty ackId means broadcast
-    const encoded = encodeProc(proc, ackId, parsedInput);
+    const encoded = encodeBroadcast(proc, parsedInput);
 
-    // Send encoded message to all sockets.
+    // Send message to all sockets.
     for (const connection of connections) {
       connection._ws.sendBinary(encoded);
     }

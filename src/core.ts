@@ -353,12 +353,19 @@ export function printMessage(
   let data: any;
 
   switch (type) {
+    case MessageType.Ready:
+      data = {
+        type: "ready",
+      };
+      break;
     case MessageType.Ping:
       data = {
         type: "ping",
-        payload: {
-          ackId: decoding.readVarString(decoder),
-        },
+      };
+      break;
+    case MessageType.Pong:
+      data = {
+        type: "pong",
       };
       break;
     case MessageType.Proc:
@@ -371,6 +378,12 @@ export function printMessage(
       data = {
         type: "ack",
         payload: decodeAck(message),
+      };
+      break;
+    case MessageType.Broadcast:
+      data = {
+        type: "broadcast",
+        payload: decodeBroadcast(message),
       };
       break;
   }

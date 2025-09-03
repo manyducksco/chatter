@@ -4,6 +4,7 @@ import {
   type AckListener,
   type Connection,
   decodeAck,
+  decodeBroadcast,
   decodeProc,
   encodeAck,
   encodeProc,
@@ -256,16 +257,26 @@ class ChatterClient implements Connection {
       this.#socket.close();
     }
 
-    const url = new URL(this.#config.url);
-    url.searchParams.set("cid", this.#clientId);
-    url.searchParams.set("sid", this.#sessionId);
-
+    const url = this.#withSearchParams(this.#config.url, {
+      cid: this.#clientId,
+      sid: this.#sessionId,
+    });
     this.#socket = new WebSocket(url);
     this.#socket.binaryType = "arraybuffer";
     this.#socket.addEventListener("open", this.#onOpen);
     this.#socket.addEventListener("close", this.#onClose);
     this.#socket.addEventListener("message", this.#onMessage);
     this.#socket.addEventListener("error", this.#onError);
+  }
+
+  #withSearchParams(url: string | URL, params: Record<string, string>): string {
+    const str = url instanceof URL ? url.toString() : url;
+    const [base, search] = str.split("?");
+    const searchParams = new URLSearchParams(search);
+    for (const key in params) {
+      searchParams.set(key, params[key]);
+    }
+    return base + "?" + searchParams.toString();
   }
 
   #setConnectionState(state: ConnectionState) {
@@ -278,18 +289,6 @@ class ChatterClient implements Connection {
       for (const callback of this.#stateChangeCallbacks) {
         callback(state);
       }
-
-      // if (this.#state === ConnectionState.Disconnected) {
-      //   // Reject all pending listeners.
-      //   for (const [id, listener] of Array.from(this.#acks.entries())) {
-      //     listener.reject(
-      //       new Error(
-      //         `Ack rejected: socket disconnected. (ackId: ${id}, proc: ${listener.proc.name})`
-      //       )
-      //     );
-      //     this.#acks.delete(id);
-      //   }
-      // }
     }
   }
 
@@ -357,9 +356,9 @@ class ChatterClient implements Connection {
 
     window.addEventListener("beforeunload", this.#beforeUnload);
 
-    // this.#updateConnectionState();
-    this.#reconnectAttempts = 0;
+    // NOTE: Connection state will be set when READY_MESSAGE is received.
 
+    this.#reconnectAttempts = 0;
     this.#queuePing();
   };
 
@@ -369,7 +368,6 @@ class ChatterClient implements Connection {
     window.removeEventListener("beforeunload", this.#beforeUnload);
 
     this.#setConnectionState(ConnectionState.Disconnected);
-    // this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -382,7 +380,6 @@ class ChatterClient implements Connection {
     window.removeEventListener("beforeunload", this.#beforeUnload);
 
     this.#setConnectionState(ConnectionState.Disconnected);
-    // this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -412,6 +409,8 @@ class ChatterClient implements Connection {
         return this.#handleReady();
       case MessageType.Pong:
         return this.#handlePong();
+      case MessageType.Broadcast:
+        return this.#handleBroadcast(message);
       case MessageType.Proc:
         return this.#handleProc(message);
       case MessageType.Ack:
@@ -420,14 +419,30 @@ class ChatterClient implements Connection {
   };
 
   async #handleReady() {
-    // Server is ready to send and receive
     this.#debug.log("CONNECTION READY");
-    // this.#setConnectionState()
   }
 
   async #handlePong() {
-    // Prevent connection close if pong was received before the timer completed.
+    // Prevent connection close when pong is received before the timer completes.
     clearTimeout(this.#pongTimer);
+  }
+
+  async #handleBroadcast(message: Uint8Array) {
+    const decoded = decodeBroadcast(message);
+    const impl = this.#procs.get(decoded.name);
+    if (!impl) return;
+
+    this.#debug.log("received broadcast", {
+      name: decoded.name,
+      input: decoded.input,
+    });
+
+    try {
+      const parsedInput = await impl.proc.parseInput(decoded.input);
+      await impl.handler(parsedInput, this);
+    } catch (error) {
+      this.#debug.warn("error while handling a broadcast", error);
+    }
   }
 
   async #handleProc(message: Uint8Array) {
@@ -445,33 +460,15 @@ class ChatterClient implements Connection {
       return;
     }
 
-    // Empty ackId is a broadcast. No acknowledgement needed.
-    if (decoded.ackId === "") {
-      try {
-        const parsedInput = await impl.proc.parseInput(decoded.input);
-        await impl.handler(parsedInput, this);
-        this.#debug.log("received broadcast", {
-          name: decoded.name,
-          input: parsedInput,
-        });
-      } catch (error) {
-        this.#debug.warn("error while handling a broadcast", error);
-      }
-
-      return;
-    }
-
     this.#debug.log("received call", {
       ackId: decoded.ackId,
       name: decoded.name,
       input: decoded.input,
     });
 
-    // Handle as a normal procedure call.
     try {
       const parsedInput = await impl.proc.parseInput(decoded.input);
       const output = await impl.handler(parsedInput, this);
-      // TODO: Crash on client if output parsing fails.
       const parsedOutput = await impl.proc.parseOutput(output);
       this.#socket.send(encodeAck(decoded.ackId, true, parsedOutput));
     } catch (error) {
