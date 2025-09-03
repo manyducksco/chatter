@@ -73,7 +73,7 @@ export interface ProcConfig<I, O> extends ProcSchema<I, O> {
 
   /**
    * Time to wait before considering this call a failure.
-   * Value in milliseconds. Default 5000 (5 seconds).
+   * Value in milliseconds. Default 30000 (30 seconds).
    */
   timeout?: number;
 }
@@ -117,7 +117,7 @@ export class Proc<I, O> {
   constructor(config: ProcConfig<I, O>) {
     this.name = config.name;
     this.schema = config as any;
-    this.timeout = config.timeout ?? 5000;
+    this.timeout = config.timeout ?? 30000;
   }
 
   /**

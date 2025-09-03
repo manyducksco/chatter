@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import {
   AckIdGenerator,
   type AckListener,
+  AckResponseCache,
   type Connection,
   decodeAck,
   decodeBroadcast,
@@ -112,6 +113,16 @@ class ChatterClient implements Connection {
   #ids = new AckIdGenerator();
   #acks = new Map<string, AckListener>();
 
+  /**
+   * Cached acknowledgements to be re-sent on reconnect.
+   */
+  #ackResponses = new AckResponseCache();
+
+  /**
+   * Cached messages that couldn't be sent while offline. To be sent when socket comes online.
+   */
+  #offlineMessageQueue: Uint8Array[] = [];
+
   #debug: Logger;
 
   constructor(config: ClientConfig) {
@@ -183,10 +194,6 @@ class ChatterClient implements Connection {
   async call<I, O>(proc: Proc<I, O>, input?: I): Promise<O> {
     const parsedInput = await proc.parseInput(input);
 
-    if (this.#socket.readyState !== WebSocket.OPEN) {
-      throw new Error("Socket is not open.");
-    }
-
     let timer: any;
     const waitTime = proc.timeout;
 
@@ -226,7 +233,18 @@ class ChatterClient implements Connection {
         this.#acks.delete(ackId);
       }, waitTime);
 
-      this.#socket.send(encodeProc(proc, ackId, parsedInput));
+      const message = encodeProc(proc, ackId, parsedInput);
+
+      if (this.#socket.readyState !== WebSocket.OPEN || !this.isConnected) {
+        // TODO: Store in offlineCallQueue
+
+        this.#debug.warn(
+          `Socket is offline; queuing call to send when connection is ready.`
+        );
+        this.#offlineMessageQueue.push(message);
+      } else {
+        this.#socket.send(message);
+      }
     }).finally(() => {
       clearTimeout(timer);
     });
@@ -398,12 +416,6 @@ class ChatterClient implements Connection {
     this.#setConnectionState(ConnectionState.Connected);
     this.#queuePing();
 
-    if (this.#config.verbose) {
-      printMessage(message, (data) => {
-        this.#debug.log("received message", data);
-      });
-    }
-
     switch (getMessageType(message)) {
       case MessageType.Ready:
         return this.#handleReady();
@@ -419,12 +431,33 @@ class ChatterClient implements Connection {
   };
 
   async #handleReady() {
-    this.#debug.log("CONNECTION READY");
+    this.#debug.log("received ready");
+
+    let sentAcks = 0;
+    let sentMessages = 0;
+
+    // Send cached acks
+    for (const [ackId, message] of this.#ackResponses.entries()) {
+      this.#socket.send(message);
+      sentAcks++;
+    }
+
+    // Send messages created while offline
+    for (const message of this.#offlineMessageQueue) {
+      this.#socket.send(message);
+      sentMessages++;
+    }
+    this.#offlineMessageQueue.length = 0;
+
+    this.#debug.log(
+      `ready: sent ${sentAcks} ack(s), ${sentMessages} message(s)`
+    );
   }
 
   async #handlePong() {
     // Prevent connection close when pong is received before the timer completes.
     clearTimeout(this.#pongTimer);
+    this.#debug.log("received pong");
   }
 
   async #handleBroadcast(message: Uint8Array) {
@@ -470,9 +503,15 @@ class ChatterClient implements Connection {
       const parsedInput = await impl.proc.parseInput(decoded.input);
       const output = await impl.handler(parsedInput, this);
       const parsedOutput = await impl.proc.parseOutput(output);
-      this.#socket.send(encodeAck(decoded.ackId, true, parsedOutput));
+
+      // Cache ack until proc timeout in case of connection failure.
+      const ack = encodeAck(decoded.ackId, true, parsedOutput);
+      this.#ackResponses.set(impl.proc, decoded.ackId, ack);
+      this.#socket.send(ack);
     } catch (error) {
-      this.#socket.send(encodeAck(decoded.ackId, false, error));
+      const ack = encodeAck(decoded.ackId, false, error);
+      this.#ackResponses.set(impl.proc, decoded.ackId, ack);
+      this.#socket.send(ack);
     }
   }
 

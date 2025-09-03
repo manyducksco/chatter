@@ -201,9 +201,16 @@ class ServerSocketHandler<ConnectionData>
       const parsedInput = await impl.proc.parseInput(decoded.input);
       const output = await impl.handler(parsedInput, connection);
       const parsedOutput = await impl.proc.parseOutput(output);
-      ws.sendBinary(encodeAck(decoded.ackId, true, parsedOutput));
+
+      // Cache message in case of connection failure.
+      const message = encodeAck(decoded.ackId, true, parsedOutput);
+      connection._ackResponses.set(impl.proc, decoded.ackId, message);
+      ws.sendBinary(message);
+      // TODO: Use return value of sendBinary to decide if we need to cache it?
     } catch (error) {
-      ws.sendBinary(encodeAck(decoded.ackId, false, error));
+      const message = encodeAck(decoded.ackId, false, error);
+      connection._ackResponses.set(impl.proc, decoded.ackId, message);
+      ws.sendBinary(message);
     }
   }
 
@@ -389,7 +396,15 @@ class ChatterServer<ConnectionData> {
 
     // Send message to all sockets.
     for (const connection of connections) {
-      connection._ws.sendBinary(encoded);
+      if (!connection.isConnected) {
+        connection._offlineMessageQueue.push(encoded);
+      } else {
+        const result = connection._ws.sendBinary(encoded);
+        if (result < 0) {
+          // Result of -1 indicates a connection failure.
+          connection._offlineMessageQueue.push(encoded);
+        }
+      }
     }
   }
 
@@ -483,6 +498,11 @@ export class ServerConnection<Data> implements Connection {
    */
   _ackResponses = new AckResponseCache();
 
+  /**
+   * Cache messages to be sent while the connection is offline.
+   */
+  _offlineMessageQueue: Uint8Array[] = [];
+
   _ids = new AckIdGenerator();
   _sessionId: string;
 
@@ -490,6 +510,12 @@ export class ServerConnection<Data> implements Connection {
 
   data: Data;
   state = ConnectionState.Connected;
+
+  get isConnected() {
+    return (
+      this._ws.readyState === 1 && this.state === ConnectionState.Connected
+    );
+  }
 
   constructor(
     server: ChatterServer<Data>,
@@ -533,7 +559,16 @@ export class ServerConnection<Data> implements Connection {
       }, waitTime);
 
       // Send over _ws, await acknowledgement.
-      this._ws.sendBinary(encodeProc(proc, ackId, parsedInput));
+      const message = encodeProc(proc, ackId, parsedInput);
+      if (!this.isConnected) {
+        this._offlineMessageQueue.push(message);
+      } else {
+        const result = this._ws.sendBinary(message);
+        if (result < 0) {
+          // Result of -1 means there was a connection error. Queue for send on reconnect.
+          this._offlineMessageQueue.push(message);
+        }
+      }
     }).finally(() => {
       clearTimeout(timer);
     });
@@ -619,6 +654,8 @@ export class ServerConnection<Data> implements Connection {
     }
     this._topics.clear();
     this._ws.close();
+    this._ackListeners.clear();
+    this._offlineMessageQueue.length = 0;
   }
 
   /**
@@ -650,5 +687,11 @@ export class ServerConnection<Data> implements Connection {
     for (const [ackId, message] of this._ackResponses.entries()) {
       ws.sendBinary(message);
     }
+
+    // Sent unsent messages
+    for (const message of this._offlineMessageQueue) {
+      ws.sendBinary(message);
+    }
+    this._offlineMessageQueue.length = 0;
   }
 }
