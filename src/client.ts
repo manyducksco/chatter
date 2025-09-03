@@ -110,8 +110,8 @@ class ChatterClient implements Connection {
   #pongTimer: any;
   #pingInterval = 30;
 
-  #ids = new AckIdGenerator();
-  #acks = new Map<string, AckListener>();
+  #ackIds = new AckIdGenerator();
+  #ackListeners = new Map<string, AckListener>();
 
   /**
    * Cached acknowledgements to be re-sent on reconnect.
@@ -124,6 +124,18 @@ class ChatterClient implements Connection {
   #offlineMessageQueue: Uint8Array[] = [];
 
   #debug: Logger;
+
+  #pingTimings: number[] = [];
+  #lastPingSentAt?: number;
+
+  get pingLatency() {
+    return {
+      latest: this.#pingTimings.at(-1),
+      average:
+        this.#pingTimings.reduce((sum, ping) => sum + ping, 0) /
+        this.#pingTimings.length,
+    };
+  }
 
   constructor(config: ClientConfig) {
     this.#config = config;
@@ -198,7 +210,7 @@ class ChatterClient implements Connection {
     const waitTime = proc.timeout;
 
     return new Promise<O>((resolve, reject) => {
-      const ackId = this.#ids.next();
+      const ackId = this.#ackIds.next();
       const listener: AckListener = {
         proc,
         timestamp: Date.now(),
@@ -223,14 +235,14 @@ class ChatterClient implements Connection {
           reject(error);
         },
       };
-      this.#acks.set(ackId, listener);
+      this.#ackListeners.set(ackId, listener);
 
       // Configure timeout
       timer = setTimeout(() => {
         listener.reject(
           new Error(`Procedure call timed out after ${waitTime}ms.`)
         );
-        this.#acks.delete(ackId);
+        this.#ackListeners.delete(ackId);
       }, waitTime);
 
       const message = encodeProc(proc, ackId, parsedInput);
@@ -311,7 +323,9 @@ class ChatterClient implements Connection {
   }
 
   #tryReconnect() {
-    if (this.#reconnectTimeout != null) return;
+    // If document is hidden we will attempt reconnect when it becomes visible again.
+    if (this.#reconnectTimeout != null || document.visibilityState === "hidden")
+      return;
 
     // Reconnect with exponential backoff (max 30 seconds)
     const delay = Math.min(1000 * 2 ** this.#reconnectAttempts++, 30000);
@@ -337,9 +351,13 @@ class ChatterClient implements Connection {
 
   #onVisibilityChange = () => {
     if (document.visibilityState === "visible") {
-      // TODO: Do a ping check
-
-      this.#connect();
+      if (this.#socket.readyState === WebSocket.OPEN) {
+        this.#pingCheck();
+      } else {
+        this.#connect();
+      }
+    } else {
+      this.#setConnectionState(ConnectionState.Unknown);
     }
   };
 
@@ -363,10 +381,24 @@ class ChatterClient implements Connection {
     // Send pings on a timer. If we don't receive a pong message in response within 5 seconds we should reconnect.
     this.#pingTimer = setTimeout(() => {
       this.#socket.send(PING_MESSAGE);
+      this.#lastPingSentAt = performance.now();
       this.#pongTimer = setTimeout(() => {
         this.#socket.close(); // should trigger reconnect
       }, 5 * 1000);
     }, this.#pingInterval * 1000);
+  }
+
+  /**
+   * Tries pinging the server to see if we're online.
+   * If we are the connection state will be set to Connected when PONG is received.
+   */
+  #pingCheck() {
+    this.#clearPing();
+    this.#socket.send(PING_MESSAGE);
+    this.#lastPingSentAt = performance.now();
+    this.#pongTimer = setTimeout(() => {
+      this.#socket.close(); // should trigger reconnect
+    }, 2 * 1000); // wait only 2 seconds
   }
 
   #onOpen = (event: Event) => {
@@ -457,7 +489,10 @@ class ChatterClient implements Connection {
   async #handlePong() {
     // Prevent connection close when pong is received before the timer completes.
     clearTimeout(this.#pongTimer);
-    this.#debug.log("received pong");
+
+    const timing = performance.now() - this.#lastPingSentAt!;
+    this.#pingTimings.push(timing);
+    this.#debug.log(`received pong in ${timing}ms`);
   }
 
   async #handleBroadcast(message: Uint8Array) {
@@ -517,7 +552,7 @@ class ChatterClient implements Connection {
 
   async #handleAck(message: Uint8Array) {
     const decoded = decodeAck(message);
-    const listener = this.#acks.get(decoded.ackId);
+    const listener = this.#ackListeners.get(decoded.ackId);
     if (!listener) {
       // Received unexpected acknowledgement.
       return;
@@ -542,6 +577,6 @@ class ChatterClient implements Connection {
       }
     }
 
-    this.#acks.delete(decoded.ackId);
+    this.#ackListeners.delete(decoded.ackId);
   }
 }
