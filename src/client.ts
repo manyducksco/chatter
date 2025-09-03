@@ -1,4 +1,4 @@
-import { v7 } from "uuid";
+import { nanoid } from "nanoid";
 import {
   AckIdGenerator,
   type AckListener,
@@ -6,11 +6,11 @@ import {
   decodeAck,
   decodeProc,
   encodeAck,
-  PING_MESSAGE,
   encodeProc,
   getMessageType,
   type Impl,
   MessageType,
+  PING_MESSAGE,
   printMessage,
   Proc,
 } from "./core";
@@ -44,9 +44,25 @@ export interface ClientConfig {
 }
 
 export enum ConnectionState {
+  /**
+   * The initial state. No active connection to the server.
+   */
   Disconnected,
+
+  /**
+   * A connection is being established. No active connection yet.
+   */
   Connecting,
+
+  /**
+   * Server connection is active and ready to send and receive.
+   */
   Connected,
+
+  /**
+   * Connection liveness needs to be checked and possibly reconnected.
+   */
+  Unknown,
 }
 
 const noop = () => undefined;
@@ -78,7 +94,7 @@ export function createClient(config: ClientConfig): ChatterClient {
 class ChatterClient implements Connection {
   #config: ClientConfig;
   #clientId = this.#getClientId();
-  #sessionId = v7();
+  #sessionId = nanoid();
 
   #state = ConnectionState.Disconnected;
   #stateChangeCallbacks = new Set<(state: ConnectionState) => void>();
@@ -222,7 +238,7 @@ class ChatterClient implements Connection {
   #getClientId() {
     let stored = localStorage.getItem(CLIENT_ID_KEY);
     if (!stored) {
-      stored = v7();
+      stored = nanoid();
       localStorage.setItem(CLIENT_ID_KEY, stored);
     }
     return stored;
@@ -240,7 +256,11 @@ class ChatterClient implements Connection {
       this.#socket.close();
     }
 
-    this.#socket = new WebSocket(this.#config.url);
+    const url = new URL(this.#config.url);
+    url.searchParams.set("cid", this.#clientId);
+    url.searchParams.set("sid", this.#sessionId);
+
+    this.#socket = new WebSocket(url);
     this.#socket.binaryType = "arraybuffer";
     this.#socket.addEventListener("open", this.#onOpen);
     this.#socket.addEventListener("close", this.#onClose);
@@ -249,38 +269,27 @@ class ChatterClient implements Connection {
   }
 
   #setConnectionState(state: ConnectionState) {
+    if (this.#socket.readyState !== WebSocket.OPEN) {
+      state = ConnectionState.Disconnected;
+    }
+
     if (state !== this.#state) {
       this.#state = state;
       for (const callback of this.#stateChangeCallbacks) {
         callback(state);
       }
 
-      if (this.#state === ConnectionState.Disconnected) {
-        // Reject all pending listeners.
-        for (const [id, listener] of Array.from(this.#acks.entries())) {
-          listener.reject(
-            new Error(
-              `Ack rejected: socket disconnected. (ackId: ${id}, proc: ${listener.proc.name})`
-            )
-          );
-          this.#acks.delete(id);
-        }
-      }
-    }
-  }
-
-  #updateConnectionState() {
-    switch (this.#socket.readyState) {
-      case WebSocket.CLOSED:
-      case WebSocket.CLOSING:
-        this.#setConnectionState(ConnectionState.Disconnected);
-        break;
-      case WebSocket.OPEN:
-        this.#setConnectionState(ConnectionState.Connected);
-        break;
-      case WebSocket.CONNECTING:
-        this.#setConnectionState(ConnectionState.Connecting);
-        break;
+      // if (this.#state === ConnectionState.Disconnected) {
+      //   // Reject all pending listeners.
+      //   for (const [id, listener] of Array.from(this.#acks.entries())) {
+      //     listener.reject(
+      //       new Error(
+      //         `Ack rejected: socket disconnected. (ackId: ${id}, proc: ${listener.proc.name})`
+      //       )
+      //     );
+      //     this.#acks.delete(id);
+      //   }
+      // }
     }
   }
 
@@ -310,10 +319,9 @@ class ChatterClient implements Connection {
   };
 
   #onVisibilityChange = () => {
-    if (
-      this.#socket.readyState !== WebSocket.OPEN &&
-      document.visibilityState === "visible"
-    ) {
+    if (document.visibilityState === "visible") {
+      // TODO: Do a ping check
+
       this.#connect();
     }
   };
@@ -349,7 +357,7 @@ class ChatterClient implements Connection {
 
     window.addEventListener("beforeunload", this.#beforeUnload);
 
-    this.#updateConnectionState();
+    // this.#updateConnectionState();
     this.#reconnectAttempts = 0;
 
     this.#queuePing();
@@ -360,7 +368,8 @@ class ChatterClient implements Connection {
 
     window.removeEventListener("beforeunload", this.#beforeUnload);
 
-    this.#updateConnectionState();
+    this.#setConnectionState(ConnectionState.Disconnected);
+    // this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -372,7 +381,8 @@ class ChatterClient implements Connection {
 
     window.removeEventListener("beforeunload", this.#beforeUnload);
 
-    this.#updateConnectionState();
+    this.#setConnectionState(ConnectionState.Disconnected);
+    // this.#updateConnectionState();
     this.#clearPing();
     this.#tryReconnect();
   };
@@ -387,7 +397,8 @@ class ChatterClient implements Connection {
     }
     const message = new Uint8Array(event.data);
 
-    this.#updateConnectionState();
+    // We must be connected if we're receiving messages.
+    this.#setConnectionState(ConnectionState.Connected);
     this.#queuePing();
 
     if (this.#config.verbose) {
@@ -397,6 +408,8 @@ class ChatterClient implements Connection {
     }
 
     switch (getMessageType(message)) {
+      case MessageType.Ready:
+        return this.#handleReady();
       case MessageType.Pong:
         return this.#handlePong();
       case MessageType.Proc:
@@ -405,6 +418,12 @@ class ChatterClient implements Connection {
         return this.#handleAck(message);
     }
   };
+
+  async #handleReady() {
+    // Server is ready to send and receive
+    this.#debug.log("CONNECTION READY");
+    // this.#setConnectionState()
+  }
 
   async #handlePong() {
     // Prevent connection close if pong was received before the timer completed.

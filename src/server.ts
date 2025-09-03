@@ -1,16 +1,18 @@
 import {
   AckIdGenerator,
   type AckListener,
+  AckResponseCache,
   type Connection,
   decodeAck,
   decodeProc,
   encodeAck,
-  PONG_MESSAGE,
   encodeProc,
   getMessageType,
+  READY_MESSAGE,
   type Impl,
   type MaybePromise,
   MessageType,
+  PONG_MESSAGE,
   Proc,
 } from "./core";
 
@@ -23,12 +25,15 @@ export type ServerProcHandler<I, O, Data> = (
   connection: ServerConnection<Data>
 ) => MaybePromise<O>;
 
-interface BroadcastOptions {
+export interface BroadcastOptions {
   exclude?: ServerConnection<any>[];
 }
 
-interface ConnectionInfo {
-  ws: Bun.ServerWebSocket<undefined>;
+interface SocketData {
+  req: Request;
+  clientId: string;
+  sessionId: string;
+  meta: Record<any, any>;
 }
 
 /**
@@ -38,7 +43,7 @@ export interface ServerOptions<Data> {
   /**
    * Called just after the client connects. The return value is set as the `data` field on the connection object.
    */
-  getConnectionData?: (info: ConnectionInfo) => Promise<Data>;
+  getConnectionData?: (ws: Bun.ServerWebSocket<SocketData>) => Promise<Data>;
 
   /**
    * Called just after the connection is initialized, but before it starts receiving events.
@@ -55,48 +60,72 @@ export interface ServerOptions<Data> {
   ) => void | Promise<void>;
 }
 
-class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
+interface HandshakeAckListener {
+  ws: Bun.ServerWebSocket<undefined>;
+}
+
+class ServerSocketHandler<ConnectionData>
+  implements Bun.WebSocketHandler<SocketData>
+{
   _server: ChatterServer<ConnectionData>;
 
   constructor(server: ChatterServer<ConnectionData>) {
     this._server = server;
   }
 
-  open = async (ws: Bun.ServerWebSocket<undefined>) => {
-    let connection: ServerConnection<ConnectionData>;
+  open = async (ws: Bun.ServerWebSocket<SocketData>) => {
+    const { sessionId } = ws.data;
 
-    // Init client
-    const opts = this._server._options;
-    if (opts.getConnectionData) {
-      const data = await opts.getConnectionData({ ws });
-      connection = new ServerConnection(this._server, ws, data);
+    const current = this._server._connections.get(sessionId);
+    if (current) {
+      // Point current connection to new socket.
+      await current._reconnect(ws);
+      console.log("Reconnected session", sessionId);
+
+      ws.sendBinary(READY_MESSAGE);
     } else {
-      connection = new ServerConnection(this._server, ws, {} as ConnectionData);
-    }
+      // Otherwise init new.
+      let connection: ServerConnection<ConnectionData>;
 
-    // Ready to receive data now.
-    this._server._connections.set(ws, connection);
+      const opts = this._server._options;
+      if (opts.getConnectionData) {
+        const data = await opts.getConnectionData(ws);
+        connection = new ServerConnection(this._server, ws, data);
+      } else {
+        const data = {} as ConnectionData;
+        connection = new ServerConnection(this._server, ws, data);
+      }
 
-    if (opts.onOpen) {
-      await opts.onOpen(connection);
+      this._server._connections.set(sessionId, connection);
+
+      if (opts.onOpen) {
+        await opts.onOpen(connection);
+      }
+
+      // Let the client know we're ready.
+      ws.sendBinary(READY_MESSAGE);
     }
   };
 
   close = async (
-    ws: Bun.ServerWebSocket<undefined>,
+    ws: Bun.ServerWebSocket<SocketData>,
     code: number,
     reason: string
   ) => {
     // Remove client
     const opts = this._server._options;
-    const connection = this._server._connections.get(ws);
+
+    const connection = this._server._connections.get(ws.data.sessionId);
+
     if (!connection) return;
 
+    connection._disconnect();
+
     // Unsubscribe from all topics.
-    connection._topics.forEach((topic) => connection.unsubscribe(topic));
+    // connection._topics.forEach((topic) => connection.unsubscribe(topic));
 
     // Already disconnected, so we can stop receiving now.
-    this._server._connections.delete(ws);
+    // this._server._connections.delete(ws);
 
     if (opts.onClose) {
       await opts.onClose(connection, code, reason);
@@ -113,25 +142,28 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
   //   console.log("pong received", connection);
   // };
 
-  drain = async (ws: Bun.ServerWebSocket<undefined>) => {};
+  drain = async (ws: Bun.ServerWebSocket<SocketData>) => {};
 
   message = async (
-    ws: Bun.ServerWebSocket<undefined>,
+    ws: Bun.ServerWebSocket<SocketData>,
     data: string | Buffer
   ) => {
-    const connection = this._server._connections.get(ws);
-    if (connection == null) {
-      throw new Error(`No connection found for this socket.`);
-    }
     if (typeof data === "string") {
       throw new Error(
         `Expected websocket message to be a Buffer. Got: ${data}`
       );
     }
+
+    const connection = this._server._connections.get(ws.data.sessionId);
+    if (connection == null) {
+      throw new Error(`No connection found for this socket.`);
+    }
+
     const message = new Uint8Array(data);
+    const type = getMessageType(message);
 
     // Process incoming message
-    switch (getMessageType(message)) {
+    switch (type) {
       case MessageType.Ping:
         return this._handlePing(connection);
       case MessageType.Proc:
@@ -181,7 +213,7 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
     message: Uint8Array
   ): Promise<void> {
     const decoded = decodeAck(message);
-    const listener = connection._acks.get(decoded.ackId);
+    const listener = connection._ackListeners.get(decoded.ackId);
     if (!listener) {
       // Received unexpected acknowledgement.
       return;
@@ -206,7 +238,7 @@ class ServerSocketHandler<ConnectionData> implements Bun.WebSocketHandler {
       }
     }
 
-    connection._acks.delete(decoded.ackId);
+    connection._ackListeners.delete(decoded.ackId);
   }
 }
 
@@ -218,10 +250,7 @@ export function createServer<ConnectionData>(
 
 class ChatterServer<ConnectionData> {
   readonly _options: ServerOptions<ConnectionData>;
-  readonly _connections = new Map<
-    Bun.ServerWebSocket,
-    ServerConnection<ConnectionData>
-  >();
+  readonly _connections = new Map<string, ServerConnection<ConnectionData>>();
   readonly _procs = new Map<
     string,
     Impl<ServerProcHandler<any, any, ConnectionData>>
@@ -229,11 +258,51 @@ class ChatterServer<ConnectionData> {
 
   _topicMap = new Map<string, Set<ServerConnection<ConnectionData>>>();
 
-  readonly websocket: ServerSocketHandler<ConnectionData>;
-
   constructor(options?: ServerOptions<ConnectionData>) {
     this._options = options ?? {};
     this.websocket = new ServerSocketHandler(this);
+  }
+
+  readonly websocket: ServerSocketHandler<ConnectionData>;
+
+  /**
+   * @param req - The request object.
+   * @param server - The Bun server object.
+   * @param meta - An optional object with values that will be accessible in `getConnectionData`.
+   */
+  async upgrade(
+    req: Request,
+    server: Bun.Server,
+    meta?: Record<any, any>
+  ): Promise<Response | undefined> {
+    const params = new URLSearchParams(req.url.split("?")[1]);
+
+    const clientId = params.get("cid");
+    const sessionId = params.get("sid");
+
+    if (!clientId) {
+      return Response.json(
+        { message: "Missing `cid` search param." },
+        { status: 400 }
+      );
+    }
+
+    if (!sessionId) {
+      return Response.json(
+        { message: "Missing `sid` search param." },
+        { status: 400 }
+      );
+    }
+
+    const upgraded = server.upgrade(req, {
+      data: { req, clientId, sessionId, meta: meta ?? {} } satisfies SocketData,
+    });
+    if (!upgraded) {
+      return Response.json(
+        { message: "Websocket upgrade failed." },
+        { status: 400 }
+      );
+    }
   }
 
   /**
@@ -326,6 +395,10 @@ class ChatterServer<ConnectionData> {
     }
   }
 
+  in(topic: string | Iterable<string>) {
+    return new TopicScope(this, topic);
+  }
+
   /**
    * Returns the first connection for which `where` returns a truthy value.
    */
@@ -353,8 +426,49 @@ class ChatterServer<ConnectionData> {
   }
 }
 
+class TopicScope<ConnectionData> {
+  #server: ChatterServer<ConnectionData>;
+  #topics: string[];
+
+  constructor(
+    server: ChatterServer<ConnectionData>,
+    topic: string | Iterable<string>
+  ) {
+    this.#server = server;
+
+    if (typeof topic === "string") {
+      this.#topics = [topic];
+    } else {
+      this.#topics = Array.from(topic);
+    }
+  }
+
+  /**
+   * Calls a procedure on all clients subscribed to `topic`.
+   */
+  async broadcast(proc: Proc<null, any>, input?: null): Promise<void>;
+  async broadcast<I>(proc: Proc<I, any>, input: I): Promise<void>;
+
+  /**
+   * Calls a procedure on all clients subscribed to any topic in `topics`.
+   */
+  async broadcast(proc: Proc<null, any>, input?: null): Promise<void>;
+  async broadcast<I>(proc: Proc<I, any>, input: I): Promise<void>;
+
+  async broadcast<I>(proc: Proc<I, any>, input?: I): Promise<void> {
+    return this.#server.broadcast(this.#topics, proc, input);
+  }
+
+  // todo: subscribe / unsubscribe (to make all sockets subscribed to a topic sub/unsub from other topics)
+}
+
 export interface ServerConnectionBroadcastOptions extends BroadcastOptions {
   includeSelf?: boolean;
+}
+
+enum ConnectionState {
+  Disconnected,
+  Connected,
 }
 
 /**
@@ -362,23 +476,31 @@ export interface ServerConnectionBroadcastOptions extends BroadcastOptions {
  */
 export class ServerConnection<Data> implements Connection {
   _server: ChatterServer<Data>;
-  _ws: Bun.ServerWebSocket;
+  _ws: Bun.ServerWebSocket<SocketData>;
   _topics = new Set<string>();
-  _acks = new Map<string, AckListener>();
+  _ackListeners = new Map<string, AckListener>();
+
+  /**
+   * Cache acks to send to the client while state is Disconnected.
+   */
+  _ackResponses = new AckResponseCache();
+
   _ids = new AckIdGenerator();
-  _pingTimer: any;
-  _staleTimer: any;
-  _pingInterval = 30;
+  _sessionId: string;
+
+  _destroyTimer: any;
 
   data: Data;
+  state = ConnectionState.Connected;
 
   constructor(
     server: ChatterServer<Data>,
-    ws: Bun.ServerWebSocket,
+    ws: Bun.ServerWebSocket<SocketData>,
     data: Data
   ) {
     this._server = server;
     this._ws = ws;
+    this._sessionId = ws.data.sessionId;
     this.data = data;
   }
 
@@ -402,14 +524,14 @@ export class ServerConnection<Data> implements Connection {
         resolve,
         reject,
       };
-      this._acks.set(ackId, listener);
+      this._ackListeners.set(ackId, listener);
 
       // Configure timeout
       timer = setTimeout(() => {
         listener.reject(
           new Error(`Procedure call timed out after ${waitTime}ms`)
         );
-        this._acks.delete(ackId);
+        this._ackListeners.delete(ackId);
       }, waitTime);
 
       // Send over _ws, await acknowledgement.
@@ -490,7 +612,45 @@ export class ServerConnection<Data> implements Connection {
     return this._topics.has(topic);
   }
 
+  /**
+   * Called when the connection needs to be cleaned up and removed and can no longer reconnect.
+   */
   _destroy() {
-    clearTimeout(this._pingTimer);
+    for (const topic of this._topics) {
+      this._server._topicMap.get(topic)?.delete(this);
+    }
+    this._topics.clear();
+    this._ws.close();
+  }
+
+  /**
+   * Called by the socket handler when the socket closes.
+   */
+  _disconnect() {
+    this.state = ConnectionState.Disconnected;
+
+    // Clean up this connection if not reconnected within 10 seconds.
+    if (!this._destroyTimer) {
+      this._destroyTimer = setTimeout(() => this._destroy(), 10000);
+    }
+  }
+
+  /**
+   * Called by the socket handler when a socket with the same sessionId is established.
+   * Associates this connection with the new websocket object.
+   */
+  async _reconnect(ws: Bun.ServerWebSocket<SocketData>) {
+    if (this._destroyTimer) {
+      clearTimeout(this._destroyTimer);
+      this._destroyTimer = undefined;
+    }
+
+    this.state = ConnectionState.Connected;
+    this._ws = ws;
+
+    // Send unsent acks (client will ignore them if they're not needed)
+    for (const [ackId, message] of this._ackResponses.entries()) {
+      ws.sendBinary(message);
+    }
   }
 }

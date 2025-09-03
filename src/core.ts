@@ -19,6 +19,30 @@ export class AckIdGenerator {
   }
 }
 
+/**
+ * A cache for ack response objects that keeps responses for proc timeout duration.
+ */
+export class AckResponseCache {
+  #cache = new Map<string, Uint8Array>();
+
+  get(ackId: string) {
+    return this.#cache.get(ackId);
+  }
+
+  set<T>(proc: Proc<any, T>, ackId: string, message: Uint8Array) {
+    this.#cache.set(ackId, message);
+
+    // Set a timer to clear after the proc would time out anyway.
+    setTimeout(() => {
+      this.#cache.delete(ackId);
+    }, proc.timeout);
+  }
+
+  entries() {
+    return this.#cache.entries();
+  }
+}
+
 export interface AckListener<O = any> {
   proc: Proc<any, O>;
   timestamp: number;
@@ -132,20 +156,51 @@ export interface Connection {
 }
 
 export enum MessageType {
-  Ping = 0,
-  Pong = 1,
-  Proc = 2,
-  Ack = 3,
+  /**
+   * Server sends Ready to client when the connection is configured.
+   */
+  Ready,
+
+  /**
+   * Client sends pings periodically to keep the connection alive.
+   */
+  Ping,
+
+  /**
+   * Server responds to Ping with Pong.
+   */
+  Pong,
+
+  /**
+   * An RPC event, sent when either end of the connection wants to call a function on the other side.
+   */
+  Proc,
+
+  /**
+   * Procs always receive an acknowledgement.
+   */
+  Ack,
+
+  /**
+   * A broadcast is a proc call to many clients without acknowledgement.
+   */
+  Broadcast,
 }
 
 export enum MessageDataType {
-  Empty = 0,
-  JSON = 1,
-  Binary = 2,
+  Empty,
+  CBOR,
+  Binary,
 }
 
 export function getMessageType(message: Uint8Array): MessageType {
   return decoding.peekUint8(decoding.createDecoder(message));
+}
+
+function _assertMessageType(actual: MessageType, expected: MessageType) {
+  if (expected !== actual) {
+    throw new Error(`Expected message type ${expected} but received ${actual}`);
+  }
 }
 
 function _encodeData(encoder: encoding.Encoder, data: unknown) {
@@ -156,11 +211,45 @@ function _encodeData(encoder: encoding.Encoder, data: unknown) {
     encoding.writeUint8(encoder, MessageDataType.Binary);
     encoding.writeVarUint8Array(encoder, data);
   } else if (data !== undefined) {
-    encoding.writeUint8(encoder, MessageDataType.JSON);
+    encoding.writeUint8(encoder, MessageDataType.CBOR);
     encoding.writeVarUint8Array(encoder, cborEnc.encode(data));
   } else {
     encoding.writeUint8(encoder, MessageDataType.Empty);
   }
+}
+
+function _decodeData(decoder: decoding.Decoder): unknown {
+  const dataType = decoding.readUint8(decoder);
+  switch (dataType) {
+    case MessageDataType.Binary:
+      return decoding.readVarUint8Array(decoder);
+    case MessageDataType.CBOR:
+      return cborDec.decode(decoding.readVarUint8Array(decoder));
+    case MessageDataType.Empty: {
+      return undefined;
+    }
+    default:
+      throw new TypeError(`Unknown data type ${dataType}`);
+  }
+}
+
+/**
+ * Broadcast is a proc call that expects no acknowledgement.
+ */
+export function encodeBroadcast<I>(proc: Proc<I, any>, input: I) {
+  const encoder = encoding.createEncoder();
+  encoding.writeUint8(encoder, MessageType.Broadcast);
+  encoding.writeVarString(encoder, proc.name);
+  _encodeData(encoder, input);
+  return encoding.toUint8Array(encoder);
+}
+
+export function decodeBroadcast(message: Uint8Array) {
+  const decoder = decoding.createDecoder(message);
+  const type = decoding.readUint8(decoder);
+  _assertMessageType(type, MessageType.Broadcast);
+  const name = decoding.readVarString(decoder);
+  return { name, input: _decodeData(decoder) };
 }
 
 export function encodeProc<I>(
@@ -179,36 +268,10 @@ export function encodeProc<I>(
 export function decodeProc(message: Uint8Array) {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
-  if (type !== MessageType.Proc) {
-    throw new TypeError(
-      `Message cannot be decoded as a procedure call. Expected type ${MessageType.Proc} but got ${type}`
-    );
-  }
+  _assertMessageType(type, MessageType.Proc);
   const ackId = decoding.readVarString(decoder);
   const name = decoding.readVarString(decoder);
-  const dataType = decoding.readUint8(decoder);
-  switch (dataType) {
-    case MessageDataType.Binary:
-      return {
-        name,
-        ackId,
-        input: decoding.readVarUint8Array(decoder),
-      };
-    case MessageDataType.JSON:
-      return {
-        name,
-        ackId,
-        input: cborDec.decode(decoding.readVarUint8Array(decoder)),
-      };
-    case MessageDataType.Empty: {
-      return {
-        name,
-        ackId,
-      };
-    }
-    default:
-      throw new TypeError(`Unknown data type ${dataType}`);
-  }
+  return { name, ackId, input: _decodeData(decoder) };
 }
 
 export function encodeAck(
@@ -240,43 +303,13 @@ export function encodeAck(
 export function decodeAck(message: Uint8Array) {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
-  if (type !== MessageType.Ack) {
-    throw new TypeError(
-      `Message cannot be decoded as an acknowledgement. Expected type ${MessageType.Ack} but got ${type}`
-    );
-  }
+  _assertMessageType(type, MessageType.Ack);
   const ackId = decoding.readVarString(decoder);
   const success = Boolean(decoding.readUint8(decoder));
   if (success) {
-    const dataType = decoding.readUint8(decoder);
-    switch (dataType) {
-      case MessageDataType.Binary:
-        return {
-          ackId,
-          success,
-          output: decoding.readVarUint8Array(decoder),
-        };
-      case MessageDataType.JSON:
-        return {
-          ackId,
-          success,
-          output: cborDec.decode(decoding.readVarUint8Array(decoder)),
-        };
-      case MessageDataType.Empty: {
-        return {
-          ackId,
-          success,
-        };
-      }
-      default:
-        throw new TypeError(`Unknown data type ${dataType}`);
-    }
+    return { ackId, success, output: _decodeData(decoder) };
   } else {
-    return {
-      ackId,
-      success,
-      error: decoding.readVarString(decoder),
-    };
+    return { ackId, success, error: decoding.readVarString(decoder) };
   }
 }
 
@@ -295,6 +328,14 @@ function _encodePong(): Uint8Array {
 // No need to encode more than once because these will always be the same.
 export const PING_MESSAGE = _encodePing();
 export const PONG_MESSAGE = _encodePong();
+
+function _encodeReady(): Uint8Array {
+  const encoder = encoding.createEncoder();
+  encoding.writeUint8(encoder, MessageType.Ready);
+  return encoding.toUint8Array(encoder);
+}
+
+export const READY_MESSAGE = _encodeReady();
 
 /**
  * Prints a human readable representation of a message for debug purposes.
@@ -322,13 +363,13 @@ export function printMessage(
       break;
     case MessageType.Proc:
       data = {
-        type: "procedure",
+        type: "proc",
         payload: decodeProc(message),
       };
       break;
     case MessageType.Ack:
       data = {
-        type: "acknowledgement",
+        type: "ack",
         payload: decodeAck(message),
       };
       break;

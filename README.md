@@ -89,9 +89,8 @@ chatter.on(UPDATE_COUNT, (amount, connection) => {
 Bun.serve({
   port: 3000,
   fetch(req, server) {
-    if (!server.upgrade(req)) {
-      return new Response("Upgrade failed :(", { status: 500 });
-    }
+    // Upgrade to a websocket connection.
+    return chatter.upgrade(req, server);
   },
   // Chatter handles the websockets
   websocket: chatter.websocket,

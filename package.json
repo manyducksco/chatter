@@ -1,7 +1,7 @@
 {
   "name": "@manyducks.co/chatter",
   "description": "Two-way websocket RPC for Bun",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,6 +21,7 @@
   "dependencies": {
     "cbor-x": "^1.6.0",
     "lib0": "^0.2.114",
+    "nanoid": "^5.1.5",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
