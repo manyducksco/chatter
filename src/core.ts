@@ -4,7 +4,6 @@ import { Decoder, Encoder, type Options } from "cbor-x";
 
 const cborOptions: Options = {
   pack: true,
-  // bundleStrings: true, // this option is occasionally causing problems reading the message
   useRecords: true,
 };
 const cborEnc = new Encoder(cborOptions);
@@ -24,6 +23,7 @@ export class AckIdGenerator {
  */
 export class AckResponseCache {
   #cache = new Map<string, Uint8Array>();
+  #timers = new Map<string, ReturnType<typeof setTimeout>>();
 
   get(ackId: string) {
     return this.#cache.get(ackId);
@@ -33,9 +33,22 @@ export class AckResponseCache {
     this.#cache.set(ackId, message);
 
     // Set a timer to clear after the proc would time out anyway.
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       this.#cache.delete(ackId);
+      this.#timers.delete(ackId);
     }, proc.timeout);
+    this.#timers.set(ackId, timer);
+  }
+
+  /**
+   * Cancels all pending expiry timers and clears the cache.
+   */
+  clear() {
+    for (const timer of this.#timers.values()) {
+      clearTimeout(timer);
+    }
+    this.#timers.clear();
+    this.#cache.clear();
   }
 
   entries() {
@@ -116,7 +129,7 @@ export class Proc<I, O> {
 
   constructor(config: ProcConfig<I, O>) {
     this.name = config.name;
-    this.schema = config as any;
+    this.schema = config;
     this.timeout = config.timeout ?? 30000;
   }
 
@@ -286,21 +299,22 @@ export function encodeAck(
   if (success) {
     _encodeData(encoder, output);
   } else {
-    if (output instanceof Error) {
-      output = output.message;
-    }
-    if (typeof output !== "string") {
+    const message = output instanceof Error ? output.message : output;
+    if (typeof message !== "string") {
       throw new Error(
-        `Output should be an error message if success is false. Got: ${output}`
+        `Output should be an error message if success is false. Got: ${message}`
       );
     }
-    encoding.writeVarString(encoder, output);
+    encoding.writeVarString(encoder, message);
   }
 
   return encoding.toUint8Array(encoder);
 }
 
-export function decodeAck(message: Uint8Array) {
+export type AckSuccess = { ackId: string; success: true; output: unknown };
+export type AckFailure = { ackId: string; success: false; error: string };
+
+export function decodeAck(message: Uint8Array): AckSuccess | AckFailure {
   const decoder = decoding.createDecoder(message);
   const type = decoding.readUint8(decoder);
   _assertMessageType(type, MessageType.Ack);

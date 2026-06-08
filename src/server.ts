@@ -40,6 +40,25 @@ interface SocketData {
 /**
  * Options passed to the Server constructor.
  */
+export interface RateLimitOptions {
+  /**
+   * Maximum number of WebSocket connections allowed per minute from a single IP.
+   * Default is 30.
+   */
+  maxConnectionsPerMinute: number;
+
+  /**
+   * Trust the `X-Forwarded-For` header for determining the client IP.
+   * Set this to `true` only when the server is running behind a trusted proxy
+   * (e.g. nginx, Cloudflare, AWS ELB) that strips existing `X-Forwarded-For`
+   * values. When `false` (default), the header is ignored and the direct
+   * TCP connection address is used instead.
+   *
+   * @default false
+   */
+  trustProxy?: boolean;
+}
+
 export interface ServerOptions<Data> {
   /**
    * Called just after the client connects. The return value is set as the `data` field on the connection object.
@@ -59,6 +78,30 @@ export interface ServerOptions<Data> {
     code: number,
     reason: string
   ) => void | Promise<void>;
+
+  /**
+   * Maximum incoming message size in bytes. Messages larger than this will close the connection.
+   * Default is unlimited.
+   */
+  maxMessageBytes?: number;
+
+  /**
+   * Rate limiting options for WebSocket upgrades.
+   */
+  rateLimit?: RateLimitOptions;
+}
+
+/**
+ * Extracts the client IP address from a request.
+ * When `trustProxy` is true, reads from the `X-Forwarded-For` header first
+ * and falls back to the direct TCP connection address.
+ */
+function getClientIP(req: Request, server: Bun.Server<SocketData>, trustProxy: boolean): string {
+  if (trustProxy) {
+    const forwarded = req.headers.get("x-forwarded-for");
+    if (forwarded) return forwarded.split(",")[0].trim();
+  }
+  return server.requestIP(req)?.address ?? "unknown";
 }
 
 interface HandshakeAckListener {
@@ -120,26 +163,11 @@ class ServerSocketHandler<ConnectionData>
 
     connection._disconnect();
 
-    // Unsubscribe from all topics.
-    // connection._topics.forEach((topic) => connection.unsubscribe(topic));
-
-    // Already disconnected, so we can stop receiving now.
-    // this._server._connections.delete(ws);
-
+    
     if (opts.onClose) {
       await opts.onClose(connection, code, reason);
     }
   };
-
-  // ping = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
-  //   const connection = this._server._connections.get(ws);
-  //   console.log("ping received", connection);
-  // };
-
-  // pong = async (ws: Bun.ServerWebSocket<undefined>, data: Buffer) => {
-  //   const connection = this._server._connections.get(ws);
-  //   console.log("pong received", connection);
-  // };
 
   drain = async (ws: Bun.ServerWebSocket<SocketData>) => {};
 
@@ -151,6 +179,12 @@ class ServerSocketHandler<ConnectionData>
       throw new Error(
         `Expected websocket message to be a Buffer. Got: ${data}`
       );
+    }
+
+    const maxBytes = this._server._options.maxMessageBytes;
+    if (maxBytes !== undefined && data.byteLength > maxBytes) {
+      ws.close(1009, "Message exceeds size limit");
+      return;
     }
 
     const connection = this._server._connections.get(ws.data.sessionId);
@@ -206,7 +240,6 @@ class ServerSocketHandler<ConnectionData>
       const message = encodeAck(decoded.ackId, true, parsedOutput);
       connection._ackResponses.set(impl.proc, decoded.ackId, message);
       ws.sendBinary(message);
-      // TODO: Use return value of sendBinary to decide if we need to cache it?
     } catch (error) {
       const message = encodeAck(decoded.ackId, false, error);
       connection._ackResponses.set(impl.proc, decoded.ackId, message);
@@ -237,11 +270,7 @@ class ServerSocketHandler<ConnectionData>
         }
       }
     } else {
-      if ((decoded.output as any) instanceof Error) {
-        listener.reject(decoded.output as any as Error);
-      } else {
-        listener.reject(new Error(decoded.output));
-      }
+      listener.reject(new Error(decoded.error));
     }
 
     connection._ackListeners.delete(decoded.ackId);
@@ -263,6 +292,32 @@ class ChatterServer<ConnectionData> {
   >();
 
   _topicMap = new Map<string, Set<ServerConnection<ConnectionData>>>();
+  readonly _ids = new AckIdGenerator();
+
+  #rateLimitMap = new Map<string, number[]>();
+  static #RATE_WINDOW_MS = 60_000;
+
+  #checkRateLimit(ip: string): boolean {
+    const now = Date.now();
+    let timestamps = this.#rateLimitMap.get(ip);
+    if (!timestamps) {
+      timestamps = [];
+      this.#rateLimitMap.set(ip, timestamps);
+    }
+
+    // Remove entries outside the window
+    const cutoff = now - ChatterServer.#RATE_WINDOW_MS;
+    const active = timestamps.filter((t) => t > cutoff);
+
+    const max = this._options.rateLimit?.maxConnectionsPerMinute ?? 30;
+    if (active.length >= max) {
+      return false;
+    }
+
+    active.push(now);
+    this.#rateLimitMap.set(ip, active);
+    return true;
+  }
 
   constructor(options?: ServerOptions<ConnectionData>) {
     this._options = options ?? {};
@@ -278,7 +333,7 @@ class ChatterServer<ConnectionData> {
    */
   async upgrade(
     req: Request,
-    server: Bun.Server,
+    server: Bun.Server<SocketData>,
     meta?: Record<any, any>
   ): Promise<Response | undefined> {
     const params = new URLSearchParams(req.url.split("?")[1]);
@@ -298,6 +353,16 @@ class ChatterServer<ConnectionData> {
         { message: "Missing `sid` search param." },
         { status: 400 }
       );
+    }
+
+    if (this._options.rateLimit) {
+      const ip = getClientIP(req, server, this._options.rateLimit.trustProxy ?? false);
+      if (!this.#checkRateLimit(ip)) {
+        return Response.json(
+          { message: "Too many connections." },
+          { status: 429 }
+        );
+      }
     }
 
     const upgraded = server.upgrade(req, {
@@ -363,8 +428,7 @@ class ChatterServer<ConnectionData> {
   ): Promise<void> {
     const parsedInput = await proc.parseInput(input);
 
-    const source = this._connections.values().next().value;
-    if (!source) return;
+    if (this._connections.size === 0) return;
 
     // Collect all connections subscribed to any of the given topics.
     const connections = new Set<ServerConnection<ConnectionData>>();
@@ -655,7 +719,9 @@ export class ServerConnection<Data> implements Connection {
     this._topics.clear();
     this._ws.close();
     this._ackListeners.clear();
+    this._ackResponses.clear();
     this._offlineMessageQueue.length = 0;
+    this._server._connections.delete(this._sessionId);
   }
 
   /**
@@ -663,6 +729,13 @@ export class ServerConnection<Data> implements Connection {
    */
   _disconnect() {
     this.state = ConnectionState.Disconnected;
+
+    // Reject pending ack listeners
+    const error = new Error("Connection closed before acknowledgement was received.");
+    for (const listener of this._ackListeners.values()) {
+      listener.reject(error);
+    }
+    this._ackListeners.clear();
 
     // Clean up this connection if not reconnected within 10 seconds.
     if (!this._destroyTimer) {

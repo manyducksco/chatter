@@ -16,7 +16,9 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "tsc"
+    "prepublishOnly": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "cbor-x": "^1.6.0",
@@ -26,7 +28,9 @@
   "devDependencies": {
     "@types/bun": "^1.2.21",
     "@types/node": "^24.3.0",
+    "happy-dom": "^20.10.2",
     "prettier": "^3.6.2",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.8"
   }
 }

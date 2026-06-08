@@ -105,9 +105,9 @@ class ChatterClient implements Connection {
 
   #socket!: WebSocket;
   #reconnectAttempts = 0;
-  #reconnectTimeout: any;
-  #pingTimer: any;
-  #pongTimer: any;
+  #reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+  #pingTimer: ReturnType<typeof setTimeout> | undefined;
+  #pongTimer: ReturnType<typeof setTimeout> | undefined;
   #pingInterval = 30;
 
   #ackIds = new AckIdGenerator();
@@ -250,22 +250,53 @@ class ChatterClient implements Connection {
     });
   }
 
+  /**
+   * Closes the connection and cleans up all resources.
+   * Removes event listeners, clears timers, and rejects pending calls.
+   */
+  disconnect() {
+    document.removeEventListener("visibilitychange", this.#onVisibilityChange);
+    document.removeEventListener("online", this.#onNetworkChange);
+    document.removeEventListener("offline", this.#onNetworkChange);
+    window.removeEventListener("beforeunload", this.#beforeUnload);
+
+    this.#clearPing();
+    clearTimeout(this.#reconnectTimeout);
+    this.#reconnectTimeout = undefined;
+
+    this.#rejectPendingAcks();
+    this.#ackResponses.clear();
+    this.#offlineMessageQueue.length = 0;
+
+    if (this.#socket) {
+      this.#socket.close(1000, "Client disconnected");
+    }
+
+    this.#setConnectionState(ConnectionState.Disconnected);
+  }
+
   /*===============================*\
   ||           Internal            ||
   \*===============================*/
 
   #getClientId() {
-    let stored = localStorage.getItem(CLIENT_ID_KEY);
-    if (!stored) {
-      stored = nanoid();
-      localStorage.setItem(CLIENT_ID_KEY, stored);
+    try {
+      let stored = localStorage.getItem(CLIENT_ID_KEY);
+      if (!stored) {
+        stored = nanoid();
+        localStorage.setItem(CLIENT_ID_KEY, stored);
+      }
+      return stored;
+    } catch {
+      return nanoid();
     }
-    return stored;
   }
 
   #connect() {
     clearTimeout(this.#reconnectTimeout);
-    this.#reconnectTimeout = null;
+    this.#reconnectTimeout = undefined;
+    clearTimeout(this.#pongTimer);
+    this.#pongTimer = undefined;
 
     // No-op if already connected.
     if (this.#socket) {
@@ -361,6 +392,8 @@ class ChatterClient implements Connection {
 
   #clearPing() {
     clearTimeout(this.#pingTimer);
+    clearTimeout(this.#pongTimer);
+    this.#pongTimer = undefined;
   }
 
   #queuePing() {
@@ -400,6 +433,14 @@ class ChatterClient implements Connection {
     this.#queuePing();
   };
 
+  #rejectPendingAcks() {
+    const error = new Error("Connection closed before acknowledgement was received.");
+    for (const listener of this.#ackListeners.values()) {
+      listener.reject(error);
+    }
+    this.#ackListeners.clear();
+  }
+
   #onClose = (event: CloseEvent) => {
     this.#debug.warn("Socket closed.");
 
@@ -407,6 +448,7 @@ class ChatterClient implements Connection {
 
     this.#setConnectionState(ConnectionState.Disconnected);
     this.#clearPing();
+    this.#rejectPendingAcks();
     this.#tryReconnect();
   };
 
@@ -419,6 +461,7 @@ class ChatterClient implements Connection {
 
     this.#setConnectionState(ConnectionState.Disconnected);
     this.#clearPing();
+    this.#rejectPendingAcks();
     this.#tryReconnect();
   };
 
@@ -558,11 +601,7 @@ class ChatterClient implements Connection {
         }
       }
     } else {
-      if ((decoded.output as any) instanceof Error) {
-        listener.reject(decoded.output as any as Error);
-      } else {
-        listener.reject(new Error(decoded.output));
-      }
+      listener.reject(new Error(decoded.error));
     }
 
     this.#ackListeners.delete(decoded.ackId);
